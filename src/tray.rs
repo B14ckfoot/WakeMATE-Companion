@@ -74,10 +74,7 @@ struct TrayApp {
 }
 
 impl TrayApp {
-    fn new(
-        config: SharedConfig,
-        assets_dir: PathBuf,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(config: SharedConfig, assets_dir: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             config: config.clone(),
             assets_dir,
@@ -95,14 +92,12 @@ impl TrayApp {
         let show_pairing_qr = MenuItem::new("Show Pairing QR Code", true, None);
         let rotate_pairing_token = MenuItem::new("Rotate Pairing Token", true, None);
         let open_data_folder = MenuItem::new("Open Data Folder", true, None);
-        let open_assets_folder = MenuItem::new("Open Assets Folder", true, None);
         let quit = MenuItem::new("Quit WakeMATE", true, None);
 
         let menu_ids = MenuIds {
             show_pairing_qr: show_pairing_qr.id().clone(),
             rotate_pairing_token: rotate_pairing_token.id().clone(),
             open_data_folder: open_data_folder.id().clone(),
-            open_assets_folder: open_assets_folder.id().clone(),
             quit: quit.id().clone(),
         };
 
@@ -110,7 +105,6 @@ impl TrayApp {
         menu.append(&show_pairing_qr)?;
         menu.append(&rotate_pairing_token)?;
         menu.append(&open_data_folder)?;
-        menu.append(&open_assets_folder)?;
         menu.append(&quit)?;
 
         let snapshot = config_snapshot(&self.config)?;
@@ -161,8 +155,6 @@ impl TrayApp {
             self.rotate_pairing_token()?;
         } else if event.id == menu_ids.open_data_folder {
             system::open_path(&AppConfig::data_dir()?)?;
-        } else if event.id == menu_ids.open_assets_folder {
-            system::open_path(&self.assets_dir)?;
         } else if event.id == menu_ids.quit {
             info!("WakeMATE quit requested from tray");
             event_loop.exit();
@@ -314,7 +306,6 @@ struct MenuIds {
     show_pairing_qr: MenuId,
     rotate_pairing_token: MenuId,
     open_data_folder: MenuId,
-    open_assets_folder: MenuId,
     quit: MenuId,
 }
 

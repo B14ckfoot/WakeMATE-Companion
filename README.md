@@ -170,7 +170,6 @@ Tray actions:
 - `Show Pairing QR Code`
 - `Rotate Pairing Token`
 - `Open Data Folder`
-- `Open Assets Folder`
 - `Quit WakeMATE`
 
 The pairing popup renders a QR code for the current `api_token` and closes on click-away or `Esc`.

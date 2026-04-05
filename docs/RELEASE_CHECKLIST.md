@@ -14,6 +14,7 @@ This checklist is for shipping a public Windows download. It is not legal advice
 
 - Confirm `allow_remote_connections` defaults to `false`.
 - Confirm `allow_discovery` defaults to `false`.
+- Confirm the Windows installer prepares a clean-install config that enables remote access and discovery for first-run pairing.
 - Confirm `allow_input_commands` and `allow_power_commands` default to `false`.
 - Confirm `GET /v1/info` requires `x-wakemate-token` in production builds.
 - Confirm the config file is created under the user app-data folder, not next to the `.exe`.

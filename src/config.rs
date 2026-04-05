@@ -13,7 +13,7 @@ const APP_DIR_NAME: &str = "WakeMATE Companion";
 const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0:7777";
 const DEFAULT_DISCOVERY_MESSAGE: &str = "wakemate:discover";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub bind_address: String,
@@ -29,6 +29,14 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
+    pub fn prepare_install_config() -> Result<Self, Box<dyn std::error::Error>> {
+        let mut config = Self::load_or_create()?;
+        config.allow_remote_connections = true;
+        config.allow_discovery = true;
+        config.save()?;
+        Ok(config)
+    }
+
     pub fn load_or_create() -> Result<Self, Box<dyn std::error::Error>> {
         let path = Self::path()?;
 

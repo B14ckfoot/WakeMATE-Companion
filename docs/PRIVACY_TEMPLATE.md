@@ -45,6 +45,7 @@ This data is stored in the user app-data directory unless changed by the user or
 
 - By default, remote access is disabled.
 - By default, UDP discovery is disabled.
+- On a clean Windows install, the installer may preconfigure remote access and discovery so the paired mobile app can find the PC on first launch.
 - If the user enables remote access, the app can receive authenticated commands over the local network.
 - If the user enables discovery, the app replies to a local-network discovery message with limited device metadata.
 

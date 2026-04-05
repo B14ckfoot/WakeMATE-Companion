@@ -1,11 +1,7 @@
 use tokio::net::UdpSocket;
 use tracing::{error, warn};
 
-use crate::{
-    config::SharedConfig,
-    system,
-    types::DiscoveryResponse,
-};
+use crate::{config::SharedConfig, system, types::DiscoveryResponse};
 
 pub async fn run(config: SharedConfig) {
     let initial = match config.lock() {
@@ -52,10 +48,15 @@ pub async fn run(config: SharedConfig) {
             continue;
         }
 
+        let network = system::primary_network_info();
         let api_port = snapshot.bind_port();
         let response = DiscoveryResponse {
             device_name: snapshot.device_name,
-            local_ip: system::local_ipv4().unwrap_or_else(|| "127.0.0.1".to_string()),
+            local_ip: network
+                .as_ref()
+                .map(|info| info.local_ip.clone())
+                .unwrap_or_else(|| system::local_ipv4().unwrap_or_else(|| "127.0.0.1".to_string())),
+            mac_address: network.as_ref().and_then(|info| info.mac_address.clone()),
             api_port,
             version: env!("CARGO_PKG_VERSION").to_string(),
         };

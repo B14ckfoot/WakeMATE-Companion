@@ -28,8 +28,27 @@ use crate::{
     config::{AppConfig, SharedConfig},
 };
 
+const PREPARE_INSTALL_CONFIG_ARG: &str = "--prepare-install-config";
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
+
+    if std::env::args()
+        .skip(1)
+        .any(|arg| arg == PREPARE_INSTALL_CONFIG_ARG)
+    {
+        let config_path = AppConfig::path()?;
+        let config = AppConfig::prepare_install_config()?;
+        info!(
+            path = %config_path.display(),
+            bind = %config.effective_bind_address(),
+            discovery_port = config.discovery_port,
+            remote_access = config.allow_remote_connections,
+            discovery_enabled = config.discovery_enabled(),
+            "WakeMATE install config prepared"
+        );
+        return Ok(());
+    }
 
     let config_path = AppConfig::path()?;
     let config = Arc::new(Mutex::new(AppConfig::load_or_create()?));

@@ -54,7 +54,7 @@ Discovery:
 - UDP port `41234` by default
 - discovery message `wakemate:discover`
 - disabled unless `allow_remote_connections` and `allow_discovery` are both `true`
-- unauthenticated discovery response is intentionally minimal: device name, local IP, API port, and version
+- unauthenticated discovery response includes device name, local IP, MAC address when available, API port, and version
 
 ## Example Command Payloads
 
@@ -186,6 +186,8 @@ For Windows release packaging, run:
 `powershell -NoProfile -ExecutionPolicy Bypass -File .\build-release.ps1`
 
 For normal Windows use, launch the built `wakemate-companion.exe` directly. The binary is configured as a tray app, so it starts without leaving a console window open.
+
+The Windows installer also prepares a clean-install config with `allow_remote_connections` and `allow_discovery` enabled so the mobile app can discover the PC immediately on first launch. Existing user configs are left alone on reinstall or upgrade.
 
 ## Release Docs
 

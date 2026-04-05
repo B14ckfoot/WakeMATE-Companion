@@ -24,7 +24,7 @@ SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
 ChangesAssociations=no
-UninstallDisplayIcon={app}\{#MyAppExeName}
+UninstallDisplayIcon={app}\app-icon.ico
 SetupIconFile=..\assets\app-icon.ico
 LicenseFile=..\docs\EULA_TEMPLATE.txt
 InfoBeforeFile=INSTALL_WARNING.txt
@@ -36,17 +36,19 @@ OutputBaseFilename=WakeMATE+Companion+Setup
 
 [Files]
 Source: "..\target\release\wakemate-companion.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\assets\app-icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\assets\tray-icon.png"; DestDir: "{app}\assets"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\assets\tray-icon.ico"; DestDir: "{app}\assets"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\docs\THIRD_PARTY_NOTICES_TEMPLATE.md"; DestDir: "{app}"; DestName: "THIRD_PARTY_NOTICES.txt"; Flags: ignoreversion
 Source: "redist\{#MyVCRedistExe}"; DestDir: "{tmp}"; Flags: deleteafterinstall
 
 [Icons]
-Name: "{group}\WakeMATE Companion"; Filename: "{app}\{#MyAppExeName}"
+Name: "{group}\WakeMATE Companion"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app-icon.ico"
 Name: "{group}\Uninstall WakeMATE Companion"; Filename: "{uninstallexe}"
 
 [Run]
 Filename: "{tmp}\{#MyVCRedistExe}"; Parameters: "/install /quiet /norestart"; StatusMsg: "Installing Microsoft Visual C++ Runtime..."; Flags: waituntilterminated runhidden skipifdoesntexist; Check: NeedsVCRedist
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--prepare-install-config"; StatusMsg: "Preparing WakeMATE pairing settings..."; Flags: waituntilterminated runhidden; Check: NeedsFirstRunConfig
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch WakeMATE Companion"; Flags: nowait postinstall skipifsilent
 
 [Code]
@@ -66,4 +68,9 @@ end;
 function NeedsVCRedist: Boolean;
 begin
   Result := not IsVCRedistInstalled;
+end;
+
+function NeedsFirstRunConfig: Boolean;
+begin
+  Result := not FileExists(ExpandConstant('{userappdata}\WakeMATE Companion\wakemate.config.json'));
 end;

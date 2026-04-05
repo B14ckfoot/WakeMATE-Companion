@@ -8,6 +8,12 @@
 - Detailed device info requires the pairing token by default.
 - The pairing token is stored in the user app-data directory, not beside the installed executable.
 
+## Windows Installer Behavior
+
+- On a clean Windows install, the installer prepares the first-run config with `allow_remote_connections` and `allow_discovery` enabled so the mobile app can auto-discover the PC immediately.
+- Existing configs are preserved on reinstall or upgrade.
+- Input and power commands still stay disabled unless the user enables them.
+
 ## Trust Model
 
 WakeMATE is designed for use on trusted devices and trusted local networks. If remote access is enabled, anyone who obtains the pairing token may be able to control the machine according to the enabled feature flags.

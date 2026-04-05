@@ -2,8 +2,8 @@ WakeMATE Companion can expose this computer to authenticated control from anothe
 
 Important:
 
-- Remote access is disabled by default.
-- UDP discovery is disabled by default.
+- On a clean install, WakeMATE prepares its first-run config so the paired mobile app can discover this PC right away.
+- Input and power control remain disabled by default.
 - If you enable remote access, devices on your local network may be able to reach this app.
 - Anyone with the pairing token may be able to control this computer according to the features you enable.
 - Only enable remote input and power controls on devices and networks you trust.

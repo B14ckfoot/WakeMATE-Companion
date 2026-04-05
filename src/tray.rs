@@ -1,9 +1,10 @@
 use std::{
+    fs, io,
     num::NonZeroU32,
     path::{Path, PathBuf},
     rc::Rc,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use font8x8::{UnicodeFonts, BASIC_FONTS};
@@ -36,6 +37,7 @@ const POPUP_LOGICAL_WIDTH: f64 = 252.0;
 const POPUP_LOGICAL_HEIGHT: f64 = 320.0;
 const POPUP_SCREEN_MARGIN: i32 = 8;
 const POPUP_OFFSET: i32 = 12;
+const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 type PopupContext = SoftbufferContext<Rc<Window>>;
 type PopupSurface = SoftbufferSurface<Rc<Window>, Rc<Window>>;
@@ -71,6 +73,8 @@ struct TrayApp {
     pairing_popup: Option<PairingPopup>,
     menu_ids: Option<MenuIds>,
     startup_error: Option<String>,
+    next_config_poll: Instant,
+    last_config_modified: Option<SystemTime>,
 }
 
 impl TrayApp {
@@ -83,6 +87,8 @@ impl TrayApp {
             pairing_popup: None,
             menu_ids: None,
             startup_error: None,
+            next_config_poll: Instant::now() + CONFIG_POLL_INTERVAL,
+            last_config_modified: config_modified_time()?,
         })
     }
 
@@ -206,6 +212,45 @@ impl TrayApp {
         Ok(())
     }
 
+    fn reload_config_if_changed(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let modified = config_modified_time()?;
+        if modified == self.last_config_modified {
+            return Ok(());
+        }
+        self.last_config_modified = modified;
+
+        let current = config_snapshot(&self.config)?;
+        let reloaded = AppConfig::load_or_create()?;
+        if reloaded == current {
+            return Ok(());
+        }
+
+        let current_server = ServerRuntimeConfig::from(&current);
+        let reloaded_server = ServerRuntimeConfig::from(&reloaded);
+
+        {
+            let mut config = self
+                .config
+                .lock()
+                .map_err(|_| io::Error::other("failed to access config"))?;
+            *config = reloaded;
+        }
+
+        if current_server != reloaded_server {
+            info!(
+                bind = %reloaded_server.bind_address,
+                discovery_port = reloaded_server.discovery_port,
+                discovery_enabled = reloaded_server.discovery_enabled,
+                "WakeMATE config changed on disk, restarting server"
+            );
+            self.server.restart(self.config.clone())?;
+        } else {
+            info!("WakeMATE config changed on disk, reloaded in memory");
+        }
+
+        Ok(())
+    }
+
     fn finish(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(error) = self.startup_error.take() {
             self.server.shutdown();
@@ -276,16 +321,28 @@ impl ApplicationHandler<UserEvent> for TrayApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        if now >= self.next_config_poll {
+            if let Err(error) = self.reload_config_if_changed() {
+                error!(error = %error, "failed to reload config changes from disk");
+            }
+            self.next_config_poll = Instant::now() + CONFIG_POLL_INTERVAL;
+        }
+
         let mut close_popup = false;
+        let popup_deadline = Instant::now() + Duration::from_millis(16);
 
         if let Some(popup) = self.pairing_popup.as_mut() {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(16),
-            ));
             close_popup = popup.should_close_for_click_away();
-        } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
         }
+
+        let next_deadline =
+            if self.pairing_popup.is_some() && popup_deadline < self.next_config_poll {
+                popup_deadline
+            } else {
+                self.next_config_poll
+            };
+        event_loop.set_control_flow(ControlFlow::WaitUntil(next_deadline));
 
         if close_popup {
             self.pairing_popup = None;
@@ -1047,6 +1104,12 @@ impl ServerThread {
         }
     }
 
+    fn restart(&mut self, config: SharedConfig) -> Result<(), Box<dyn std::error::Error>> {
+        self.finish()?;
+        *self = Self::spawn(config)?;
+        Ok(())
+    }
+
     fn finish(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.shutdown();
 
@@ -1067,6 +1130,32 @@ fn config_snapshot(config: &SharedConfig) -> Result<AppConfig, Box<dyn std::erro
         .lock()
         .map(|guard| guard.clone())
         .map_err(|_| std::io::Error::other("failed to access application config").into())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ServerRuntimeConfig {
+    bind_address: String,
+    discovery_port: u16,
+    discovery_enabled: bool,
+}
+
+impl From<&AppConfig> for ServerRuntimeConfig {
+    fn from(config: &AppConfig) -> Self {
+        Self {
+            bind_address: config.effective_bind_address(),
+            discovery_port: config.discovery_port,
+            discovery_enabled: config.discovery_enabled(),
+        }
+    }
+}
+
+fn config_modified_time() -> io::Result<Option<SystemTime>> {
+    let path = AppConfig::path()?;
+    match fs::metadata(path) {
+        Ok(metadata) => metadata.modified().map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn load_tray_icon(assets_dir: &Path) -> Result<Icon, Box<dyn std::error::Error>> {

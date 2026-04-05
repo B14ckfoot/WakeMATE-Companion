@@ -72,6 +72,8 @@ pub struct InfoResponse {
 pub struct DiscoveryResponse {
     pub device_name: String,
     pub local_ip: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mac_address: Option<String>,
     pub api_port: u16,
     pub version: String,
 }

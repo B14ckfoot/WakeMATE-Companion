@@ -1,0 +1,6 @@
+/target
+/dist/installer
+/wakemate.config.json
+/.DS_Store
+/installer/redist/innosetup-*.exe
+*.log

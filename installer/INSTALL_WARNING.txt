@@ -1,0 +1,12 @@
+WakeMATE Companion can expose this computer to authenticated control from another paired device.
+
+Important:
+
+- On a clean install, WakeMATE prepares its first-run config so the paired mobile app can discover this PC right away.
+- Input and power control remain disabled by default.
+- If you enable remote access, devices on your local network may be able to reach this app.
+- Anyone with the pairing token may be able to control this computer according to the features you enable.
+- Only enable remote input and power controls on devices and networks you trust.
+- Rotate the pairing token if it may have been exposed.
+
+By continuing, you acknowledge that you understand these risks and will configure the software appropriately.

@@ -10,7 +10,10 @@ use crate::{
     error::AppError,
     input::InputController,
     system,
-    types::{ApiResponse, CommandRequest, HealthResponse, InfoResponse, WakeRequest, AUTH_HEADER},
+    types::{
+        ApiResponse, CommandRequest, HealthResponse, InfoResponse, PairingActivationResponse,
+        WakeRequest, AUTH_HEADER,
+    },
 };
 
 #[derive(Clone)]
@@ -30,6 +33,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/health", get(health))
         .route("/v1/info", get(info))
         .route("/v1/pairing/check", get(pairing_check))
+        .route("/v1/pairing/activate", post(pairing_activate))
         .route("/v1/wake", post(wake))
         .route("/v1/command", post(command))
         .layer(DefaultBodyLimit::max(8 * 1024))
@@ -98,6 +102,18 @@ async fn pairing_check(
     let config = config_snapshot(&state.config)?;
     validate_token(&headers, &config.api_token)?;
     Ok(Json(ApiResponse::message("pairing token accepted")))
+}
+
+async fn pairing_activate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ApiResponse<PairingActivationResponse>>, AppError> {
+    let response = update_paired_capabilities(&state.config, &headers)?;
+
+    Ok(Json(ApiResponse::ok(
+        "paired controls enabled",
+        response,
+    )))
 }
 
 async fn wake(
@@ -233,4 +249,26 @@ fn config_snapshot(config: &SharedConfig) -> Result<AppConfig, AppError> {
         .lock()
         .map(|guard| guard.clone())
         .map_err(|_| AppError::internal("failed to access application config"))
+}
+
+fn update_paired_capabilities(
+    config: &SharedConfig,
+    headers: &HeaderMap,
+) -> Result<PairingActivationResponse, AppError> {
+    let mut guard = config
+        .lock()
+        .map_err(|_| AppError::internal("failed to access application config"))?;
+
+    validate_token(headers, &guard.api_token)?;
+
+    guard.allow_input_commands = true;
+    guard.allow_power_commands = true;
+    guard
+        .save()
+        .map_err(|_| AppError::internal("failed to save paired control settings"))?;
+
+    Ok(PairingActivationResponse {
+        allow_input_commands: guard.allow_input_commands,
+        allow_power_commands: guard.allow_power_commands,
+    })
 }

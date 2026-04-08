@@ -78,6 +78,12 @@ pub struct DiscoveryResponse {
     pub version: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct PairingActivationResponse {
+    pub allow_input_commands: bool,
+    pub allow_power_commands: bool,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct WakeRequest {
     pub mac: String,

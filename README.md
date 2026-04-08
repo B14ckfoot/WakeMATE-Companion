@@ -42,12 +42,17 @@ Authenticated endpoints:
 
 - `GET /v1/info`
 - `GET /v1/pairing/check`
+- `POST /v1/pairing/activate`
 - `POST /v1/wake`
 - `POST /v1/command`
 
 Auth header:
 
 - `x-wakemate-token: <your token>`
+
+Pairing activation:
+
+- `POST /v1/pairing/activate` enables `allow_input_commands` and `allow_power_commands` for the paired computer and saves the updated config.
 
 Discovery:
 

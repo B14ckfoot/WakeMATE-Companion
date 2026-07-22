@@ -5,7 +5,10 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use uuid::Uuid;
+
+use crate::credential_store;
 
 pub type SharedConfig = Arc<Mutex<AppConfig>>;
 
@@ -13,13 +16,32 @@ const APP_DIR_NAME: &str = "WakeMATE Companion";
 const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0:7777";
 const DEFAULT_DISCOVERY_MESSAGE: &str = "wakemate:discover";
 
+/// Records where the pairing token currently lives so the UI can be honest
+/// about it and so `save_to_path` knows whether it is safe to omit the
+/// secret from the on-disk config file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenStorage {
+    /// Windows Credential Manager / macOS Keychain / platform keyring.
+    Keyring,
+    /// Fallback: kept in the plaintext config file because the OS
+    /// credential store was unavailable on this machine.
+    #[default]
+    File,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub bind_address: String,
     pub discovery_port: u16,
     pub discovery_message: String,
+    /// In-memory pairing token. When `token_storage` is `Keyring` this is
+    /// hydrated from the OS credential store at load time and blanked out
+    /// before the struct is written back to disk; see `hydrate_token` and
+    /// `save_to_path`.
     pub api_token: String,
+    pub token_storage: TokenStorage,
     pub device_name: String,
     pub launch_on_startup: bool,
     pub allow_input_commands: bool,
@@ -30,18 +52,15 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
-    pub fn prepare_install_config() -> Result<Self, Box<dyn std::error::Error>> {
-        let path = Self::path()?;
-        Self::prepare_install_config_at_path(&path)
-    }
-
     pub fn prepare_install_config_at_path(
         path: &PathBuf,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut config = Self::load_or_create_from_path(path)?;
-        config.launch_on_startup = true;
-        config.allow_remote_connections = true;
-        config.allow_discovery = true;
+        let config = Self {
+            launch_on_startup: true,
+            allow_remote_connections: true,
+            allow_discovery: true,
+            ..Self::load_or_create_from_path(path)?
+        };
         config.save_to_path(path)?;
         Ok(config)
     }
@@ -54,16 +73,67 @@ impl AppConfig {
     pub fn load_or_create_from_path(path: &PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         let path = path.clone();
 
-        if path.exists() {
+        let mut config = if path.exists() {
             let raw = fs::read_to_string(&path)?;
             let mut config: Self = serde_json::from_str(&raw)?;
             config.normalize();
-            return Ok(config);
-        }
+            config
+        } else {
+            Self::default()
+        };
 
-        let config = Self::default();
+        config.hydrate_token();
         config.save_to_path(&path)?;
         Ok(config)
+    }
+
+    /// Resolves the active pairing token, preferring the OS credential store.
+    ///
+    /// - If the credential store already has an entry, it wins (it is the
+    ///   source of truth once migration has happened).
+    /// - Otherwise, whatever is already in `self.api_token` is used (a fresh
+    ///   UUID for a brand new config, or a legacy plaintext value read from
+    ///   an older config file) and an attempt is made to migrate it into the
+    ///   credential store.
+    /// - If the credential store is unavailable on this machine, the token
+    ///   stays in the config file and that fact is recorded in
+    ///   `token_storage` so the UI can surface it honestly.
+    fn hydrate_token(&mut self) {
+        if let Some(token) = credential_store::load_token() {
+            self.api_token = token;
+            self.token_storage = TokenStorage::Keyring;
+            return;
+        }
+
+        let token = if self.api_token.trim().is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            self.api_token.clone()
+        };
+
+        match credential_store::store_token(&token) {
+            Ok(()) => {
+                self.api_token = token;
+                self.token_storage = TokenStorage::Keyring;
+            }
+            Err(error) => {
+                warn!(
+                    %error,
+                    "OS credential store unavailable; keeping the pairing token in the config file"
+                );
+                self.api_token = token;
+                self.token_storage = TokenStorage::File;
+            }
+        }
+    }
+
+    /// Clears all local state (including the stored pairing token) and
+    /// starts over with fresh secure defaults. This only touches local
+    /// device state -- WakeMATE has no cloud account to sign out of.
+    pub fn reset_to_defaults(&mut self) {
+        credential_store::delete_token();
+        *self = Self::default();
+        self.hydrate_token();
     }
 
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -77,7 +147,14 @@ impl AppConfig {
             fs::create_dir_all(parent)?;
         }
 
-        let json = serde_json::to_string_pretty(self)?;
+        // Once the token lives in the OS credential store there is no
+        // reason for a plaintext copy to also sit in the config file.
+        let mut on_disk = self.clone();
+        if on_disk.token_storage == TokenStorage::Keyring {
+            on_disk.api_token = String::new();
+        }
+
+        let json = serde_json::to_string_pretty(&on_disk)?;
         fs::write(path, json)?;
         Ok(())
     }
@@ -128,9 +205,25 @@ impl AppConfig {
         self.allow_remote_connections && self.allow_discovery
     }
 
+    /// Rotates the pairing token, preferring to store the new value in the
+    /// OS credential store. Returns the new token; callers are expected to
+    /// call `save()` afterwards as with any other config change.
     pub fn rotate_api_token(&mut self) -> String {
-        self.api_token = Uuid::new_v4().to_string();
-        self.api_token.clone()
+        let new_token = Uuid::new_v4().to_string();
+
+        match credential_store::store_token(&new_token) {
+            Ok(()) => self.token_storage = TokenStorage::Keyring,
+            Err(error) => {
+                warn!(
+                    %error,
+                    "OS credential store unavailable; rotated token will be kept in the config file"
+                );
+                self.token_storage = TokenStorage::File;
+            }
+        }
+
+        self.api_token = new_token.clone();
+        new_token
     }
 
     fn normalize(&mut self) {
@@ -140,10 +233,6 @@ impl AppConfig {
 
         if self.discovery_message.trim().is_empty() {
             self.discovery_message = DEFAULT_DISCOVERY_MESSAGE.to_string();
-        }
-
-        if self.api_token.trim().is_empty() {
-            self.api_token = Uuid::new_v4().to_string();
         }
 
         if self.device_name.trim().is_empty() {
@@ -158,7 +247,8 @@ impl Default for AppConfig {
             bind_address: DEFAULT_BIND_ADDRESS.to_string(),
             discovery_port: 41234,
             discovery_message: DEFAULT_DISCOVERY_MESSAGE.to_string(),
-            api_token: Uuid::new_v4().to_string(),
+            api_token: String::new(),
+            token_storage: TokenStorage::default(),
             device_name: detect_device_name(),
             launch_on_startup: true,
             allow_input_commands: false,
@@ -209,7 +299,8 @@ fn home_dir() -> io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::AppConfig;
+    use super::{AppConfig, TokenStorage};
+    use crate::credential_store;
 
     #[test]
     fn localhost_is_the_secure_default_bind() {
@@ -235,11 +326,75 @@ mod tests {
 
         assert_ne!(old_token, new_token);
         assert_eq!(config.api_token, new_token);
+        assert_eq!(config.token_storage, TokenStorage::Keyring);
     }
 
     #[test]
     fn launch_on_startup_is_enabled_by_default() {
         let config = AppConfig::default();
         assert!(config.launch_on_startup);
+    }
+
+    #[test]
+    fn hydrate_token_migrates_a_legacy_plaintext_value_into_the_credential_store() {
+        let mut config = AppConfig {
+            api_token: "legacy-plaintext-token".to_string(),
+            ..AppConfig::default()
+        };
+
+        config.hydrate_token();
+
+        assert_eq!(config.api_token, "legacy-plaintext-token");
+        assert_eq!(config.token_storage, TokenStorage::Keyring);
+        assert_eq!(
+            credential_store::load_token().as_deref(),
+            Some("legacy-plaintext-token")
+        );
+    }
+
+    #[test]
+    fn hydrate_token_generates_a_fresh_token_when_none_exists() {
+        let mut config = AppConfig::default();
+        assert!(config.api_token.is_empty());
+
+        config.hydrate_token();
+
+        assert!(!config.api_token.is_empty());
+        assert_eq!(config.token_storage, TokenStorage::Keyring);
+    }
+
+    #[test]
+    fn save_to_path_blanks_the_token_once_it_is_in_the_credential_store() {
+        let mut config = AppConfig::default();
+        config.hydrate_token();
+        let dir = std::env::temp_dir().join(format!(
+            "wakemate-config-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = dir.join("wakemate.config.json");
+
+        config.save_to_path(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let on_disk: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(on_disk["api_token"], "");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reset_to_defaults_replaces_the_stored_token() {
+        let mut config = AppConfig::default();
+        config.hydrate_token();
+        let original_token = config.api_token.clone();
+        config.allow_input_commands = true;
+
+        config.reset_to_defaults();
+
+        assert_ne!(config.api_token, original_token);
+        assert!(!config.allow_input_commands);
+        assert_eq!(
+            credential_store::load_token().as_deref(),
+            Some(config.api_token.as_str())
+        );
     }
 }

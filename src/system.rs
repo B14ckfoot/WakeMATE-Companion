@@ -13,15 +13,22 @@ use std::{os::windows::ffi::OsStrExt, ptr};
 
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::{
-    Foundation::{FreeLibrary, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS},
+    Foundation::{CloseHandle, FreeLibrary, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HANDLE},
     System::{
         LibraryLoader::{GetProcAddress, LoadLibraryW},
         Registry::{
             RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
             KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
         },
+        Threading::CreateMutexW,
+    },
+    UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONWARNING, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO, MESSAGEBOX_RESULT,
     },
 };
+
+#[cfg(target_os = "windows")]
+const IDYES: MESSAGEBOX_RESULT = 6;
 
 use crate::types::SystemAction;
 
@@ -138,7 +145,7 @@ pub fn perform_system_action(action: SystemAction) -> Result<&'static str, Strin
 pub fn sync_launch_on_startup(enabled: bool) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        return sync_launch_on_startup_windows(enabled);
+        sync_launch_on_startup_windows(enabled)
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -151,7 +158,7 @@ pub fn sync_launch_on_startup(enabled: bool) -> Result<(), String> {
 pub fn enable_preferred_dark_mode() -> bool {
     #[cfg(target_os = "windows")]
     {
-        return enable_preferred_dark_mode_windows();
+        enable_preferred_dark_mode_windows()
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -163,7 +170,7 @@ pub fn enable_preferred_dark_mode() -> bool {
 pub fn sync_prelogon_server_task(enabled: bool, config_path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        return sync_prelogon_server_task_windows(enabled, config_path);
+        sync_prelogon_server_task_windows(enabled, config_path)
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -214,7 +221,7 @@ fn sync_launch_on_startup_windows(enabled: bool) -> Result<(), String> {
 
     let result = unsafe {
         if enabled {
-            let command = wide_null(&startup_command(&exe_path));
+            let command = wide_null(startup_command(&exe_path));
             RegSetValueExW(
                 key,
                 value_name.as_ptr(),
@@ -342,13 +349,13 @@ fn enable_preferred_dark_mode_windows() -> bool {
     let set_mode = unsafe {
         GetProcAddress(
             module,
-            UXTHEME_ORDINAL_SET_PREFERRED_APP_MODE as usize as *const u8,
+            UXTHEME_ORDINAL_SET_PREFERRED_APP_MODE as *const u8,
         )
     };
     let flush_menu_themes = unsafe {
         GetProcAddress(
             module,
-            UXTHEME_ORDINAL_FLUSH_MENU_THEMES as usize as *const u8,
+            UXTHEME_ORDINAL_FLUSH_MENU_THEMES as *const u8,
         )
     };
 
@@ -396,6 +403,88 @@ type SetPreferredAppMode = unsafe extern "system" fn(PreferredAppMode) -> Prefer
 
 #[cfg(target_os = "windows")]
 type FlushMenuThemes = unsafe extern "system" fn();
+
+/// Shows a native, modal, always-on-top Yes/No prompt. Returns `true` only
+/// on an explicit "Yes".
+///
+/// This intentionally uses a plain Win32 `MessageBoxW` rather than a custom
+/// window: it is unambiguous, always on top, cannot be scripted or spoofed
+/// by web content, and needs no additional rendering code to get right for
+/// a security-critical decision.
+#[cfg(target_os = "windows")]
+pub fn confirm_dialog(title: &str, message: &str) -> bool {
+    let title = wide_null(title);
+    let message = wide_null(message);
+
+    let result = unsafe {
+        MessageBoxW(
+            0,
+            message.as_ptr(),
+            title.as_ptr(),
+            MB_YESNO | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND,
+        )
+    };
+
+    result == IDYES
+}
+
+/// Asks the person sitting at this computer whether a device should be
+/// allowed to pair and gain input/power control.
+#[cfg(target_os = "windows")]
+pub fn confirm_pairing_dialog(device_hint: &str) -> bool {
+    confirm_dialog(
+        "WakeMATE Pairing Request",
+        &format!(
+            "A device at {device_hint} wants to pair with this computer and enable remote mouse, keyboard, and power control.\n\nOnly approve this if you just started pairing from the WakeMATE app on your own phone.\n\nAllow it?",
+        ),
+    )
+}
+
+/// Guards a Windows named mutex for the lifetime of the process so a second
+/// copy of WakeMATE cannot bind the same port or show a duplicate tray icon.
+/// Keep the returned guard alive for as long as the app runs; dropping it
+/// releases the lock.
+#[cfg(target_os = "windows")]
+pub struct SingleInstanceLock {
+    handle: HANDLE,
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for SingleInstanceLock {
+    fn drop(&mut self) {
+        if self.handle != 0 {
+            unsafe {
+                CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
+/// Attempts to acquire the single-instance lock. Returns `Ok(None)` if
+/// another WakeMATE process already holds it.
+#[cfg(target_os = "windows")]
+pub fn acquire_single_instance_lock() -> Result<Option<SingleInstanceLock>, String> {
+    let name = wide_null("Local\\WakeMATE-Companion-SingleInstance-BA6C6A3E");
+
+    // Safety: `name` is a valid, null-terminated wide string kept alive for
+    // the duration of this call, and CreateMutexW does not retain the
+    // pointer past that.
+    let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
+
+    if handle == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+
+    let already_running = unsafe { windows_sys::Win32::Foundation::GetLastError() } == ERROR_ALREADY_EXISTS;
+    if already_running {
+        unsafe {
+            CloseHandle(handle);
+        }
+        return Ok(None);
+    }
+
+    Ok(Some(SingleInstanceLock { handle }))
+}
 
 pub fn open_path(path: &Path) -> Result<(), String> {
     let path = path

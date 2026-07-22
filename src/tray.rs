@@ -3,6 +3,7 @@ use std::{
     num::NonZeroU32,
     path::{Path, PathBuf},
     rc::Rc,
+    sync::Arc,
     thread,
     time::{Duration, Instant, SystemTime},
 };
@@ -30,6 +31,7 @@ use winit::{
 
 use crate::{
     config::{AppConfig, SharedConfig},
+    pairing::{PairingCoordinator, PairingRequestInfo},
     run_server, system,
 };
 
@@ -116,8 +118,10 @@ impl TrayApp {
             None,
         );
         let open_data_folder = MenuItem::new("Open Data Folder", true, None);
+        let reset_companion = MenuItem::new("Reset Companion...", true, None);
         let quit = MenuItem::new("Quit WakeMATE", true, None);
         let separator_top = PredefinedMenuItem::separator();
+        let separator_middle = PredefinedMenuItem::separator();
         let separator_bottom = PredefinedMenuItem::separator();
 
         let tray_menu = TrayMenu {
@@ -128,6 +132,7 @@ impl TrayApp {
                 rotate_pairing_token: rotate_pairing_token.id().clone(),
                 launch_on_startup: launch_on_startup.id().clone(),
                 open_data_folder: open_data_folder.id().clone(),
+                reset_companion: reset_companion.id().clone(),
                 quit: quit.id().clone(),
             },
         };
@@ -137,8 +142,10 @@ impl TrayApp {
         menu.append(&show_pairing_qr)?;
         menu.append(&rotate_pairing_token)?;
         menu.append(&launch_on_startup)?;
-        menu.append(&separator_bottom)?;
+        menu.append(&separator_middle)?;
         menu.append(&open_data_folder)?;
+        menu.append(&reset_companion)?;
+        menu.append(&separator_bottom)?;
         menu.append(&quit)?;
 
         let tooltip = format!("WakeMATE Companion ({})", snapshot.device_name);
@@ -204,6 +211,7 @@ impl TrayApp {
             rotate_pairing_token,
             launch_on_startup,
             open_data_folder,
+            reset_companion,
             quit,
         )) = self.tray_menu.as_ref().map(|tray_menu| {
             (
@@ -211,6 +219,7 @@ impl TrayApp {
                 tray_menu.ids.rotate_pairing_token.clone(),
                 tray_menu.ids.launch_on_startup.clone(),
                 tray_menu.ids.open_data_folder.clone(),
+                tray_menu.ids.reset_companion.clone(),
                 tray_menu.ids.quit.clone(),
             )
         })
@@ -226,11 +235,51 @@ impl TrayApp {
             self.toggle_launch_on_startup()?;
         } else if event.id == open_data_folder {
             system::open_path(&AppConfig::data_dir()?)?;
+        } else if event.id == reset_companion {
+            self.reset_companion()?;
         } else if event.id == quit {
             info!("WakeMATE quit requested from tray");
             event_loop.exit();
         }
 
+        Ok(())
+    }
+
+    fn reset_companion(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let confirmed = system::confirm_dialog(
+            "Reset WakeMATE Companion?",
+            "This clears the pairing token and all local WakeMATE settings on this computer, \
+             including which capabilities were approved for paired phones. Every phone will \
+             need to re-scan a fresh pairing code afterwards.\n\n\
+             This does not affect your WakeMATE mobile account or any cloud data.\n\n\
+             Reset now?",
+        );
+
+        if !confirmed {
+            return Ok(());
+        }
+
+        self.pairing_popup = None;
+        let restart_needed = {
+            let mut config = self
+                .config
+                .lock()
+                .map_err(|_| io::Error::other("failed to access config"))?;
+            let previous = ServerRuntimeConfig::from(&*config);
+            config.reset_to_defaults();
+            config.save()?;
+            previous != ServerRuntimeConfig::from(&*config)
+        };
+
+        if let Err(error) = system::sync_launch_on_startup(config_snapshot(&self.config)?.launch_on_startup) {
+            warn!(%error, "failed to sync the Windows startup preference after reset");
+        }
+
+        self.refresh_tray_state()?;
+        if restart_needed {
+            self.server.restart(self.config.clone())?;
+        }
+        info!("WakeMATE Companion was reset to defaults from the tray");
         Ok(())
     }
 
@@ -462,6 +511,7 @@ struct MenuIds {
     rotate_pairing_token: MenuId,
     launch_on_startup: MenuId,
     open_data_folder: MenuId,
+    reset_companion: MenuId,
     quit: MenuId,
 }
 
@@ -1203,6 +1253,9 @@ impl ServerThread {
 
     fn spawn(config: SharedConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let pairing = Arc::new(PairingCoordinator::new(Some(Arc::new(
+            windows_pairing_notifier,
+        ))));
 
         let join_handle = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1212,7 +1265,7 @@ impl ServerThread {
 
             runtime
                 .block_on(async move {
-                    run_server(config, async move {
+                    run_server(config, pairing, false, async move {
                         let _ = shutdown_rx.await;
                     })
                     .await
@@ -1268,6 +1321,38 @@ fn config_snapshot(config: &SharedConfig) -> Result<AppConfig, Box<dyn std::erro
         .lock()
         .map(|guard| guard.clone())
         .map_err(|_| std::io::Error::other("failed to access application config").into())
+}
+
+/// Shows the native "allow this device to pair?" prompt on its own thread
+/// (so the HTTP handler that triggered it never blocks) and, only on an
+/// explicit "Yes", flips on input/power control and persists it.
+fn windows_pairing_notifier(info: PairingRequestInfo, config: SharedConfig) {
+    thread::spawn(move || {
+        let approved = system::confirm_pairing_dialog(&info.peer.to_string());
+
+        if !approved {
+            info!(peer = %info.peer, "WakeMATE pairing request denied on the desktop");
+            return;
+        }
+
+        let outcome = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let mut guard = config
+                .lock()
+                .map_err(|_| std::io::Error::other("failed to access config"))?;
+            guard.allow_input_commands = true;
+            guard.allow_power_commands = true;
+            guard.save()?;
+            Ok(())
+        })();
+
+        match outcome {
+            Ok(()) => info!(
+                peer = %info.peer,
+                "WakeMATE pairing approved on the desktop; input and power control enabled"
+            ),
+            Err(error) => error!(%error, "failed to persist approved pairing settings"),
+        }
+    });
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1407,7 +1492,7 @@ mod tests {
     fn popup_frame_renders_full_pixel_buffer() {
         let frame = render_pairing_popup("test-token", "Desk Rig", 252, 320).unwrap();
         assert_eq!(frame.len(), 252 * 320);
-        assert!(frame.iter().any(|color| *color == 0x00111111));
+        assert!(frame.contains(&0x00111111));
     }
 
     #[test]

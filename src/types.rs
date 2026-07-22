@@ -82,6 +82,10 @@ pub struct DiscoveryResponse {
 pub struct PairingActivationResponse {
     pub allow_input_commands: bool,
     pub allow_power_commands: bool,
+    /// `"pending_approval"` until the person at the desktop approves the
+    /// prompt; poll `/v1/pairing/check` or `/v1/info` afterwards to see the
+    /// flags flip to `true`.
+    pub status: &'static str,
 }
 
 #[derive(Debug, Deserialize)]

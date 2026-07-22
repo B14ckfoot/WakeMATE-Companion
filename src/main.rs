@@ -2,9 +2,12 @@
 
 mod app;
 mod config;
+mod credential_store;
 mod discovery;
 mod error;
 mod input;
+mod pairing;
+mod security;
 mod system;
 #[cfg(target_os = "windows")]
 mod tray;
@@ -12,6 +15,7 @@ mod types;
 
 use std::{
     future::Future,
+    net::SocketAddr,
     sync::{Arc, Mutex},
 };
 
@@ -26,6 +30,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use crate::{
     app::{router, AppState},
     config::{AppConfig, SharedConfig},
+    pairing::PairingCoordinator,
 };
 
 const PREPARE_INSTALL_CONFIG_ARG: &str = "--prepare-install-config";
@@ -99,6 +104,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(target_os = "windows")]
     {
+        let _single_instance_lock = match system::acquire_single_instance_lock() {
+            Ok(Some(lock)) => Some(lock),
+            Ok(None) => {
+                info!("WakeMATE is already running; exiting this second instance");
+                return Ok(());
+            }
+            Err(error) => {
+                warn!(%error, "failed to acquire the WakeMATE single-instance lock; continuing anyway");
+                None
+            }
+        };
+
         tray::run(config)?;
         Ok(())
     }
@@ -109,7 +126,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .enable_all()
             .build()?;
 
-        runtime.block_on(run_server(config, shutdown_signal()))?;
+        // No desktop confirmation surface exists on this platform yet, so
+        // pairing activation is refused rather than silently auto-approved.
+        let pairing = Arc::new(PairingCoordinator::unavailable());
+        runtime.block_on(run_server(config, pairing, false, shutdown_signal()))?;
         Ok(())
     }
 }
@@ -125,6 +145,8 @@ fn init_tracing() {
 
 pub(crate) async fn run_server<F>(
     config: SharedConfig,
+    pairing: Arc<PairingCoordinator>,
+    headless: bool,
     shutdown: F,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -133,7 +155,7 @@ where
     let snapshot = config_snapshot(&config)?;
     let bind_address = snapshot.effective_bind_address();
     let listener = TcpListener::bind(&bind_address).await?;
-    info!(bind = %bind_address, "WakeMATE HTTP listener ready");
+    info!(bind = %bind_address, headless, "WakeMATE HTTP listener ready");
 
     let discovery_task = if snapshot.discovery_enabled() {
         Some(tokio::spawn(discovery::run(config.clone())))
@@ -142,9 +164,13 @@ where
         None
     };
 
-    axum::serve(listener, router(AppState::new(config)))
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    let state = AppState::new(config, pairing, headless);
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await?;
 
     if let Some(discovery_task) = discovery_task {
         discovery_task.abort();
@@ -234,6 +260,15 @@ fn run_headless_server(config_path: std::path::PathBuf) -> Result<(), Box<dyn st
         .enable_all()
         .build()?;
 
-    runtime.block_on(run_server(config, std::future::pending::<()>()))?;
+    // The pre-logon service runs with no interactive desktop session, so
+    // there is nobody who could approve a pairing prompt or receive
+    // injected input; both are refused unconditionally (see AppState).
+    let pairing = Arc::new(PairingCoordinator::unavailable());
+    runtime.block_on(run_server(
+        config,
+        pairing,
+        true,
+        std::future::pending::<()>(),
+    ))?;
     Ok(())
 }

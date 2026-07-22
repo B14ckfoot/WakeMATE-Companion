@@ -1,5 +1,7 @@
+use std::{net::SocketAddr, sync::Arc};
+
 use axum::{
-    extract::{DefaultBodyLimit, State},
+    extract::{ConnectInfo, DefaultBodyLimit, State},
     http::HeaderMap,
     routing::{get, post},
     Json, Router,
@@ -9,6 +11,8 @@ use crate::{
     config::{AppConfig, SharedConfig},
     error::AppError,
     input::InputController,
+    pairing::{PairingCoordinator, PairingOutcome, PairingRequestInfo},
+    security::{tokens_match, RateLimiter},
     system,
     types::{
         ApiResponse, CommandRequest, HealthResponse, InfoResponse, PairingActivationResponse,
@@ -19,11 +23,22 @@ use crate::{
 #[derive(Clone)]
 pub struct AppState {
     pub config: SharedConfig,
+    pub rate_limiter: Arc<RateLimiter>,
+    pub pairing: Arc<PairingCoordinator>,
+    /// Set for the boot-time, pre-logon service instance. No interactive
+    /// desktop session exists to approve a pairing prompt or receive input
+    /// commands in that context, so both are refused regardless of config.
+    pub headless: bool,
 }
 
 impl AppState {
-    pub fn new(config: SharedConfig) -> Self {
-        Self { config }
+    pub fn new(config: SharedConfig, pairing: Arc<PairingCoordinator>, headless: bool) -> Self {
+        Self {
+            config,
+            rate_limiter: Arc::new(RateLimiter::new()),
+            pairing,
+            headless,
+        }
     }
 }
 
@@ -59,11 +74,12 @@ async fn health(State(state): State<AppState>) -> Json<ApiResponse<HealthRespons
 
 async fn info(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<InfoResponse>>, AppError> {
     let config = config_snapshot(&state.config)?;
     if config.require_auth_for_info {
-        validate_token(&headers, &config.api_token)?;
+        authenticate(&state, peer, &headers, &config.api_token)?;
     }
 
     let bind_address = config.effective_bind_address();
@@ -97,29 +113,55 @@ async fn info(
 
 async fn pairing_check(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     let config = config_snapshot(&state.config)?;
-    validate_token(&headers, &config.api_token)?;
+    authenticate(&state, peer, &headers, &config.api_token)?;
     Ok(Json(ApiResponse::message("pairing token accepted")))
 }
 
 async fn pairing_activate(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<PairingActivationResponse>>, AppError> {
-    let response = update_paired_capabilities(&state.config, &headers)?;
+    let config = config_snapshot(&state.config)?;
+    authenticate(&state, peer, &headers, &config.api_token)?;
 
-    Ok(Json(ApiResponse::ok("paired controls enabled", response)))
+    if state.headless {
+        return Err(AppError::forbidden(
+            "no one is signed in on this computer right now, so pairing cannot be confirmed; \
+             open the WakeMATE tray app on the desktop and try again",
+        ));
+    }
+
+    match state
+        .pairing
+        .request(PairingRequestInfo { peer: peer.ip() }, state.config.clone())
+    {
+        PairingOutcome::AwaitingApproval => Ok(Json(ApiResponse::ok(
+            "waiting for approval on the desktop",
+            PairingActivationResponse {
+                allow_input_commands: config.allow_input_commands,
+                allow_power_commands: config.allow_power_commands,
+                status: "pending_approval",
+            },
+        ))),
+        PairingOutcome::Unavailable => Err(AppError::forbidden(
+            "the WakeMATE tray app is not running, so pairing cannot be confirmed on this computer",
+        )),
+    }
 }
 
 async fn wake(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<WakeRequest>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     let config = config_snapshot(&state.config)?;
-    validate_token(&headers, &config.api_token)?;
+    authenticate(&state, peer, &headers, &config.api_token)?;
 
     system::send_wol(
         &request.mac,
@@ -133,11 +175,12 @@ async fn wake(
 
 async fn command(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<CommandRequest>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     let config = config_snapshot(&state.config)?;
-    validate_token(&headers, &config.api_token)?;
+    authenticate(&state, peer, &headers, &config.api_token)?;
 
     let input = InputController;
     let message = match request {
@@ -155,14 +198,14 @@ async fn command(
             "wake packet sent".to_string()
         }
         CommandRequest::MouseMove { delta_x, delta_y } => {
-            ensure_input_enabled(&config)?;
+            ensure_input_enabled(&state, &config)?;
             input
                 .mouse_move_relative(delta_x, delta_y)
                 .map_err(AppError::internal)?;
             format!("mouse moved by {delta_x}, {delta_y}")
         }
         CommandRequest::MouseClick { button, double } => {
-            ensure_input_enabled(&config)?;
+            ensure_input_enabled(&state, &config)?;
             let button = button.unwrap_or(crate::types::MouseButtonArg::Left);
             let double = double.unwrap_or(false);
             input
@@ -175,7 +218,7 @@ async fn command(
             }
         }
         CommandRequest::MouseScroll { direction, amount } => {
-            ensure_input_enabled(&config)?;
+            ensure_input_enabled(&state, &config)?;
             let amount = amount.unwrap_or(3);
             input
                 .mouse_scroll(direction, amount)
@@ -183,22 +226,22 @@ async fn command(
             "mouse scroll sent".to_string()
         }
         CommandRequest::KeyPress { key } => {
-            ensure_input_enabled(&config)?;
+            ensure_input_enabled(&state, &config)?;
             input.key_press(&key).map_err(AppError::bad_request)?;
             format!("key press sent: {key}")
         }
         CommandRequest::TextInput { text } => {
-            ensure_input_enabled(&config)?;
+            ensure_input_enabled(&state, &config)?;
             input.text_input(&text).map_err(AppError::internal)?;
             "text input sent".to_string()
         }
         CommandRequest::Media { action } => {
-            ensure_input_enabled(&config)?;
+            ensure_input_enabled(&state, &config)?;
             input.media_action(action).map_err(AppError::bad_request)?;
             "media command sent".to_string()
         }
         CommandRequest::System { action } => {
-            ensure_power_enabled(&config)?;
+            ensure_power_enabled(&state, &config)?;
             system::perform_system_action(action)
                 .map_err(AppError::unsupported)?
                 .to_string()
@@ -208,20 +251,46 @@ async fn command(
     Ok(Json(ApiResponse::message(message)))
 }
 
-fn validate_token(headers: &HeaderMap, expected_token: &str) -> Result<(), AppError> {
+/// Validates the pairing token with a constant-time comparison and applies
+/// the per-IP lockout so a stolen or guessed token cannot be brute-forced by
+/// hammering any authenticated endpoint.
+fn authenticate(
+    state: &AppState,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+    expected_token: &str,
+) -> Result<(), AppError> {
+    if let Some(remaining) = state.rate_limiter.locked_out(peer.ip()) {
+        return Err(AppError::too_many_requests(format!(
+            "too many failed attempts; try again in {} seconds",
+            remaining.as_secs().max(1)
+        )));
+    }
+
     let provided = headers
         .get(AUTH_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| AppError::unauthorized("unauthorized"))?;
+        .and_then(|value| value.to_str().ok());
 
-    if provided != expected_token {
+    let accepted = provided
+        .map(|provided| tokens_match(provided, expected_token))
+        .unwrap_or(false);
+
+    if !accepted {
+        state.rate_limiter.record_failure(peer.ip());
         return Err(AppError::unauthorized("unauthorized"));
     }
 
+    state.rate_limiter.record_success(peer.ip());
     Ok(())
 }
 
-fn ensure_input_enabled(config: &AppConfig) -> Result<(), AppError> {
+fn ensure_input_enabled(state: &AppState, config: &AppConfig) -> Result<(), AppError> {
+    if state.headless {
+        return Err(AppError::forbidden(
+            "input commands are not available from the pre-logon service",
+        ));
+    }
+
     if config.allow_input_commands {
         Ok(())
     } else {
@@ -231,7 +300,7 @@ fn ensure_input_enabled(config: &AppConfig) -> Result<(), AppError> {
     }
 }
 
-fn ensure_power_enabled(config: &AppConfig) -> Result<(), AppError> {
+fn ensure_power_enabled(_state: &AppState, config: &AppConfig) -> Result<(), AppError> {
     if config.allow_power_commands {
         Ok(())
     } else {
@@ -246,26 +315,4 @@ fn config_snapshot(config: &SharedConfig) -> Result<AppConfig, AppError> {
         .lock()
         .map(|guard| guard.clone())
         .map_err(|_| AppError::internal("failed to access application config"))
-}
-
-fn update_paired_capabilities(
-    config: &SharedConfig,
-    headers: &HeaderMap,
-) -> Result<PairingActivationResponse, AppError> {
-    let mut guard = config
-        .lock()
-        .map_err(|_| AppError::internal("failed to access application config"))?;
-
-    validate_token(headers, &guard.api_token)?;
-
-    guard.allow_input_commands = true;
-    guard.allow_power_commands = true;
-    guard
-        .save()
-        .map_err(|_| AppError::internal("failed to save paired control settings"))?;
-
-    Ok(PairingActivationResponse {
-        allow_input_commands: guard.allow_input_commands,
-        allow_power_commands: guard.allow_power_commands,
-    })
 }

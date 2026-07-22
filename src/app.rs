@@ -110,10 +110,7 @@ async fn pairing_activate(
 ) -> Result<Json<ApiResponse<PairingActivationResponse>>, AppError> {
     let response = update_paired_capabilities(&state.config, &headers)?;
 
-    Ok(Json(ApiResponse::ok(
-        "paired controls enabled",
-        response,
-    )))
+    Ok(Json(ApiResponse::ok("paired controls enabled", response)))
 }
 
 async fn wake(

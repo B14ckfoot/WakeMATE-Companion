@@ -155,8 +155,11 @@ fn parse_key(raw: &str) -> Option<Key> {
         "volumeup" => Some(Key::VolumeUp),
         "volumedown" => Some(Key::VolumeDown),
         "mute" | "volumemute" => Some(Key::VolumeMute),
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         "playpause" | "mediaplaypause" => Some(Key::MediaPlayPause),
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         "nexttrack" | "medianexttrack" => Some(Key::MediaNextTrack),
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         "prevtrack" | "previoustrack" | "mediaprevtrack" => Some(Key::MediaPrevTrack),
         _ if key.chars().count() == 1 => Some(Key::Layout(key.chars().next()?)),
         _ => None,

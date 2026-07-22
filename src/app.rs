@@ -110,10 +110,7 @@ async fn pairing_activate(
 ) -> Result<Json<ApiResponse<PairingActivationResponse>>, AppError> {
     let response = update_paired_capabilities(&state.config, &headers)?;
 
-    Ok(Json(ApiResponse::ok(
-        "paired controls enabled",
-        response,
-    )))
+    Ok(Json(ApiResponse::ok("paired controls enabled", response)))
 }
 
 async fn wake(
@@ -175,6 +172,17 @@ async fn command(
                 "mouse double click sent".to_string()
             } else {
                 "mouse click sent".to_string()
+            }
+        }
+        CommandRequest::MouseButton { button, action } => {
+            ensure_input_enabled(&config)?;
+            let button = button.unwrap_or(crate::types::MouseButtonArg::Left);
+            input
+                .mouse_button(button, action)
+                .map_err(AppError::internal)?;
+            match action {
+                crate::types::MouseButtonAction::Down => "mouse button pressed".to_string(),
+                crate::types::MouseButtonAction::Up => "mouse button released".to_string(),
             }
         }
         CommandRequest::MouseScroll { direction, amount } => {

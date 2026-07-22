@@ -1,6 +1,6 @@
 use enigo::{Enigo, Key, KeyboardControllable, MouseButton, MouseControllable};
 
-use crate::types::{MediaAction, MouseButtonArg, ScrollDirection};
+use crate::types::{MediaAction, MouseButtonAction, MouseButtonArg, ScrollDirection};
 
 #[derive(Default)]
 pub struct InputController;
@@ -19,6 +19,22 @@ impl InputController {
         enigo.mouse_click(button);
         if double {
             enigo.mouse_click(button);
+        }
+
+        Ok(())
+    }
+
+    pub fn mouse_button(
+        &self,
+        button: MouseButtonArg,
+        action: MouseButtonAction,
+    ) -> Result<(), String> {
+        let mut enigo = Enigo::new();
+        let button = map_mouse_button(button);
+
+        match action {
+            MouseButtonAction::Down => enigo.mouse_down(button),
+            MouseButtonAction::Up => enigo.mouse_up(button),
         }
 
         Ok(())
@@ -139,8 +155,11 @@ fn parse_key(raw: &str) -> Option<Key> {
         "volumeup" => Some(Key::VolumeUp),
         "volumedown" => Some(Key::VolumeDown),
         "mute" | "volumemute" => Some(Key::VolumeMute),
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         "playpause" | "mediaplaypause" => Some(Key::MediaPlayPause),
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         "nexttrack" | "medianexttrack" => Some(Key::MediaNextTrack),
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         "prevtrack" | "previoustrack" | "mediaprevtrack" => Some(Key::MediaPrevTrack),
         _ if key.chars().count() == 1 => Some(Key::Layout(key.chars().next()?)),
         _ => None,

@@ -53,6 +53,7 @@ Filename: "{app}\{#MyAppExeName}"; Description: "Launch WakeMATE Companion"; Fla
 
 [UninstallRun]
 Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""WakeMATE Companion Server"" /F"; Flags: runhidden skipifdoesntexist
+Filename: "{sys}\reg.exe"; Parameters: "delete ""HKCU\Software\Microsoft\Windows\CurrentVersion\Run"" /v ""WakeMATE Companion"" /f"; Flags: runhidden skipifdoesntexist
 
 [Code]
 function IsVCRedistInstalled: Boolean;

@@ -32,7 +32,7 @@ use winit::{
 use crate::{
     config::{AppConfig, SharedConfig},
     pairing::{PairingCoordinator, PairingRequestInfo},
-    run_server, system,
+    run_server, system, theme,
 };
 
 const POPUP_LOGICAL_WIDTH: f64 = 280.0;
@@ -175,29 +175,53 @@ impl TrayApp {
 
         if let Some(tray_icon) = &self.tray_icon {
             tray_icon.set_tooltip(Some(format!(
-                "WakeMATE Companion ({})",
-                snapshot.device_name
+                "WakeMATE Companion\n{}\n{}",
+                self.status_label(),
+                self.address_label(&snapshot)
             )))?;
         }
 
         Ok(())
     }
 
+    /// A short, human-readable pairing/connectivity state for the tray menu
+    /// and tooltip -- one of a small set of well-defined states rather than
+    /// raw config booleans, so the person looking at the tray icon always
+    /// knows roughly what WakeMATE is doing right now.
     fn status_label(&self) -> String {
         let config = match config_snapshot(&self.config) {
             Ok(config) => config,
-            Err(_) => return "WakeMATE status unavailable".to_string(),
+            Err(_) => return "Status unavailable (see logs)".to_string(),
         };
 
+        if let Some(error) = &self.startup_error {
+            return format!("{} — Error: {error}", config.device_name);
+        }
+
+        let state = if !self.server.active
+            && !system::server_is_reachable(&config.effective_bind_address())
+        {
+            "Server not running"
+        } else if !config.allow_remote_connections {
+            "Local only — not discoverable"
+        } else if config.allow_input_commands || config.allow_power_commands {
+            "Paired — remote control enabled"
+        } else {
+            "Ready to pair"
+        };
+
+        format!("{} — {state}", config.device_name)
+    }
+
+    fn address_label(&self, config: &AppConfig) -> String {
         let port = config.bind_port();
         if config.allow_remote_connections {
-            if let Some(ip) = system::local_ipv4() {
-                format!("{} on {}:{}", config.device_name, ip, port)
-            } else {
-                format!("{} on port {}", config.device_name, port)
+            match system::local_ipv4() {
+                Some(ip) => format!("{ip}:{port}"),
+                None => format!("port {port}"),
             }
         } else {
-            format!("{} on localhost:{}", config.device_name, port)
+            format!("localhost:{port}")
         }
     }
 
@@ -271,7 +295,9 @@ impl TrayApp {
             previous != ServerRuntimeConfig::from(&*config)
         };
 
-        if let Err(error) = system::sync_launch_on_startup(config_snapshot(&self.config)?.launch_on_startup) {
+        if let Err(error) =
+            system::sync_launch_on_startup(config_snapshot(&self.config)?.launch_on_startup)
+        {
             warn!(%error, "failed to sync the Windows startup preference after reset");
         }
 
@@ -762,17 +788,8 @@ fn render_pairing_popup(
     let device_label = popup_device_label(device_name, 22);
     let mut pixels = vec![0; (width * height) as usize];
 
-    fill_vertical_gradient(&mut pixels, width, height, rgb(10, 14, 20), rgb(21, 28, 38));
-    fill_rect(
-        &mut pixels,
-        width,
-        height,
-        0,
-        0,
-        width,
-        4,
-        rgb(77, 163, 255),
-    );
+    fill_vertical_gradient(&mut pixels, width, height, theme::BG_BASE, theme::SURFACE);
+    fill_rect(&mut pixels, width, height, 0, 0, width, 4, theme::PRIMARY);
     draw_rect_outline(
         &mut pixels,
         width,
@@ -782,7 +799,7 @@ fn render_pairing_popup(
         width,
         height,
         1,
-        rgb(49, 63, 78),
+        theme::BORDER,
     );
     fill_rect(
         &mut pixels,
@@ -792,7 +809,7 @@ fn render_pairing_popup(
         layout.qr_y - 16,
         layout.qr_size + 32,
         layout.qr_size + 32,
-        rgb(7, 11, 18),
+        theme::BG_ELEVATED,
     );
     fill_rect(
         &mut pixels,
@@ -802,7 +819,7 @@ fn render_pairing_popup(
         layout.qr_y - 12,
         layout.qr_size + 24,
         layout.qr_size + 24,
-        rgb(255, 255, 255),
+        0x00FFFFFF,
     );
     draw_rect_outline(
         &mut pixels,
@@ -813,7 +830,7 @@ fn render_pairing_popup(
         layout.qr_size + 24,
         layout.qr_size + 24,
         1,
-        rgb(196, 206, 217),
+        theme::BORDER,
     );
     draw_centered_text(
         &mut pixels,
@@ -822,7 +839,7 @@ fn render_pairing_popup(
         layout.title_y,
         "WakeMATE",
         title_scale,
-        rgb(244, 247, 250),
+        theme::TEXT_PRIMARY,
     );
     draw_centered_text(
         &mut pixels,
@@ -831,7 +848,7 @@ fn render_pairing_popup(
         layout.subtitle_y,
         "PAIR FROM YOUR PHONE",
         subtitle_scale,
-        rgb(119, 190, 255),
+        theme::ACCENT_LIGHT,
     );
     draw_centered_text(
         &mut pixels,
@@ -840,7 +857,7 @@ fn render_pairing_popup(
         layout.device_y,
         &device_label,
         1,
-        rgb(152, 165, 179),
+        theme::TEXT_MUTED,
     );
     draw_qr_code(
         &mut pixels,
@@ -856,9 +873,9 @@ fn render_pairing_popup(
         width,
         height,
         layout.footer_y,
-        "SCAN IN THE WAKE MATE APP",
+        "SCAN IN THE WAKEMATE APP",
         1,
-        rgb(161, 173, 187),
+        theme::TEXT_MUTED,
     );
     draw_centered_text(
         &mut pixels,
@@ -867,7 +884,7 @@ fn render_pairing_popup(
         layout.footer2_y,
         "CLICK OUTSIDE OR PRESS ESC",
         1,
-        rgb(104, 119, 135),
+        theme::TEXT_FAINT,
     );
 
     Ok(pixels)
@@ -1419,11 +1436,12 @@ fn default_icon() -> Result<Icon, Box<dyn std::error::Error>> {
             let center_right = (17..=20).contains(&x) && (14..=24).contains(&y);
             let pixel_on = border || left_stroke || right_stroke || center_left || center_right;
 
-            let (r, g, b, a) = if pixel_on {
-                (250, 250, 250, 255)
+            let (r, g, b) = if pixel_on {
+                theme::channels(theme::TEXT_PRIMARY)
             } else {
-                (17, 52, 81, 255)
+                theme::channels(theme::PRIMARY)
             };
+            let a = 255;
 
             rgba[idx] = r;
             rgba[idx + 1] = g;

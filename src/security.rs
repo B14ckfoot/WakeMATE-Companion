@@ -56,7 +56,10 @@ impl RateLimiter {
 
     /// Returns `Some(remaining)` if the given address is currently locked out.
     pub fn locked_out(&self, addr: IpAddr) -> Option<Duration> {
-        let attempts = self.attempts.lock().unwrap_or_else(|poison| poison.into_inner());
+        let attempts = self
+            .attempts
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let record = attempts.get(&addr)?;
         let locked_until = record.locked_until?;
         let now = Instant::now();
@@ -68,7 +71,10 @@ impl RateLimiter {
     }
 
     pub fn record_failure(&self, addr: IpAddr) {
-        let mut attempts = self.attempts.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut attempts = self
+            .attempts
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let now = Instant::now();
         let record = attempts.entry(addr).or_default();
 
@@ -90,7 +96,10 @@ impl RateLimiter {
     }
 
     pub fn record_success(&self, addr: IpAddr) {
-        let mut attempts = self.attempts.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut attempts = self
+            .attempts
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         attempts.remove(&addr);
     }
 }

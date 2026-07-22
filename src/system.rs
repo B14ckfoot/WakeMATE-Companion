@@ -13,7 +13,9 @@ use std::{os::windows::ffi::OsStrExt, ptr};
 
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, FreeLibrary, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HANDLE},
+    Foundation::{
+        CloseHandle, FreeLibrary, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HANDLE,
+    },
     System::{
         LibraryLoader::{GetProcAddress, LoadLibraryW},
         Registry::{
@@ -346,18 +348,10 @@ fn enable_preferred_dark_mode_windows() -> bool {
         return false;
     }
 
-    let set_mode = unsafe {
-        GetProcAddress(
-            module,
-            UXTHEME_ORDINAL_SET_PREFERRED_APP_MODE as *const u8,
-        )
-    };
-    let flush_menu_themes = unsafe {
-        GetProcAddress(
-            module,
-            UXTHEME_ORDINAL_FLUSH_MENU_THEMES as *const u8,
-        )
-    };
+    let set_mode =
+        unsafe { GetProcAddress(module, UXTHEME_ORDINAL_SET_PREFERRED_APP_MODE as *const u8) };
+    let flush_menu_themes =
+        unsafe { GetProcAddress(module, UXTHEME_ORDINAL_FLUSH_MENU_THEMES as *const u8) };
 
     let enabled = if let Some(set_mode) = set_mode {
         let set_mode: SetPreferredAppMode = unsafe { std::mem::transmute(set_mode) };
@@ -475,7 +469,8 @@ pub fn acquire_single_instance_lock() -> Result<Option<SingleInstanceLock>, Stri
         return Err(std::io::Error::last_os_error().to_string());
     }
 
-    let already_running = unsafe { windows_sys::Win32::Foundation::GetLastError() } == ERROR_ALREADY_EXISTS;
+    let already_running =
+        unsafe { windows_sys::Win32::Foundation::GetLastError() } == ERROR_ALREADY_EXISTS;
     if already_running {
         unsafe {
             CloseHandle(handle);

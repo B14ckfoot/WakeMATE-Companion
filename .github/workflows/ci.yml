@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows (build, test, lint, audit)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Verify Cargo.lock is up to date
+        run: cargo check --locked
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --release --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --release --locked
+
+      - name: cargo build --release
+        run: cargo build --release --locked
+
+      - name: cargo install cargo-audit
+        run: cargo install cargo-audit --locked
+        continue-on-error: true
+
+      - name: cargo audit
+        run: cargo audit
+        continue-on-error: true
+
+      - name: Upload Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: wakemate-companion-windows-binary
+          path: target/release/wakemate-companion.exe
+          if-no-files-found: error
+
+  macos:
+    name: macOS (build headless target + package .dmg)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo test
+        run: cargo test --release --locked
+
+      - name: cargo build --release
+        run: cargo build --release --locked
+
+      - name: Package unsigned .dmg
+        run: |
+          chmod +x installer/macos/package-macos.sh
+          ./installer/macos/package-macos.sh
+
+      - name: Upload macOS artifact (unsigned, see docs/MACOS_BUILD.md)
+        uses: actions/upload-artifact@v4
+        with:
+          name: wakemate-companion-macos-unsigned-dmg
+          path: dist/macos/*.dmg
+          if-no-files-found: error

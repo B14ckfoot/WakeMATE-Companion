@@ -1,6 +1,6 @@
 use std::{
     env, fs, io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -52,9 +52,7 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
-    pub fn prepare_install_config_at_path(
-        path: &PathBuf,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn prepare_install_config_at_path(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let config = Self {
             launch_on_startup: true,
             allow_remote_connections: true,
@@ -70,11 +68,9 @@ impl AppConfig {
         Self::load_or_create_from_path(&path)
     }
 
-    pub fn load_or_create_from_path(path: &PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
-        let path = path.clone();
-
+    pub fn load_or_create_from_path(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let mut config = if path.exists() {
-            let raw = fs::read_to_string(&path)?;
+            let raw = fs::read_to_string(path)?;
             let mut config: Self = serde_json::from_str(&raw)?;
             config.normalize();
             config
@@ -83,7 +79,7 @@ impl AppConfig {
         };
 
         config.hydrate_token();
-        config.save_to_path(&path)?;
+        config.save_to_path(path)?;
         Ok(config)
     }
 
@@ -141,8 +137,7 @@ impl AppConfig {
         self.save_to_path(&path)
     }
 
-    pub fn save_to_path(&self, path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-        let path = path.clone();
+    pub fn save_to_path(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -309,6 +304,9 @@ mod tests {
     }
 
     #[test]
+    // Field-by-field mutation is the point of this test: it asserts on the
+    // state *between* the two flags being set, which a struct literal can't express.
+    #[allow(clippy::field_reassign_with_default)]
     fn discovery_requires_remote_connections() {
         let mut config = AppConfig::default();
         config.allow_discovery = true;
@@ -367,10 +365,8 @@ mod tests {
     fn save_to_path_blanks_the_token_once_it_is_in_the_credential_store() {
         let mut config = AppConfig::default();
         config.hydrate_token();
-        let dir = std::env::temp_dir().join(format!(
-            "wakemate-config-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("wakemate-config-test-{}", uuid::Uuid::new_v4()));
         let path = dir.join("wakemate.config.json");
 
         config.save_to_path(&path).unwrap();

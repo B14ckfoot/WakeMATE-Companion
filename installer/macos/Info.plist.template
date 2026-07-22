@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>WakeMATE Companion</string>
+    <key>CFBundleDisplayName</key>
+    <string>WakeMATE Companion</string>
+    <!--
+        Placeholder identifier. Replace with the identifier registered under
+        your actual Apple Developer account/team before signing, matching
+        the convention used by the mobile app's bundle ID
+        (Wakemate-Mobile/WakeMate-Mobile/app.json currently uses the Expo
+        default "com.anonymous.wakematemobile", which itself should be
+        finalized before shipping either app).
+    -->
+    <key>CFBundleIdentifier</key>
+    <string>com.wakemate.companion</string>
+    <key>CFBundleVersion</key>
+    <string>__VERSION__</string>
+    <key>CFBundleShortVersionString</key>
+    <string>__VERSION__</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleExecutable</key>
+    <string>wakemate-companion</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon.icns</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>LSUIElement</key>
+    <!--
+        1 = no Dock icon / no menu bar, i.e. a pure background agent.
+        Once the macOS menu-bar UI described in docs/MACOS_BUILD.md exists,
+        this should stay 1 (a menu-bar-only app, like the Windows tray).
+    -->
+    <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright WakeMATE. All rights reserved.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>WakeMATE Companion listens on your local network so the WakeMATE mobile app can discover, wake, and (once paired) control this computer.</string>
+</dict>
+</plist>

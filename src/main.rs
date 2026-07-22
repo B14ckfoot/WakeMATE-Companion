@@ -9,6 +9,7 @@ mod input;
 mod pairing;
 mod security;
 mod system;
+mod theme;
 #[cfg(target_os = "windows")]
 mod tray;
 mod types;

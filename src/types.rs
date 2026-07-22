@@ -107,6 +107,10 @@ pub enum CommandRequest {
         button: Option<MouseButtonArg>,
         double: Option<bool>,
     },
+    MouseButton {
+        button: Option<MouseButtonArg>,
+        action: MouseButtonAction,
+    },
     MouseScroll {
         direction: ScrollDirection,
         amount: Option<i32>,
@@ -131,6 +135,13 @@ pub enum MouseButtonArg {
     Left,
     Right,
     Middle,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseButtonAction {
+    Down,
+    Up,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]

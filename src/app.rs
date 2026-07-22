@@ -177,6 +177,17 @@ async fn command(
                 "mouse click sent".to_string()
             }
         }
+        CommandRequest::MouseButton { button, action } => {
+            ensure_input_enabled(&config)?;
+            let button = button.unwrap_or(crate::types::MouseButtonArg::Left);
+            input
+                .mouse_button(button, action)
+                .map_err(AppError::internal)?;
+            match action {
+                crate::types::MouseButtonAction::Down => "mouse button pressed".to_string(),
+                crate::types::MouseButtonAction::Up => "mouse button released".to_string(),
+            }
+        }
         CommandRequest::MouseScroll { direction, amount } => {
             ensure_input_enabled(&config)?;
             let amount = amount.unwrap_or(3);

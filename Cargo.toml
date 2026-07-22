@@ -1,0 +1,28 @@
+[package]
+name = "wakemate-companion"
+version = "0.1.0"
+edition = "2021"
+description = "WakeMATE desktop companion for device discovery, Wake-on-LAN, and remote input control"
+
+[build-dependencies]
+winres = "0.1"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros"] }
+enigo = "0.1"
+network-interface = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+font8x8 = "0.3"
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
+qrcodegen = "1.8"
+softbuffer = "0.4"
+tray-icon = "0.22"
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security", "Win32_System_LibraryLoader", "Win32_System_Registry"] }
+winit = "0.30"

@@ -1,0 +1,32 @@
+WakeMATE Companion End User License Agreement
+
+Replace this template before release. This is not legal advice.
+
+1. License
+You are granted a limited, non-exclusive, non-transferable license to install and use WakeMATE Companion.
+
+2. Remote Control Features
+WakeMATE Companion can enable remote wake, input, media, and power-control features. Those features may allow another paired device on your local network to interact with this computer. You are responsible for enabling those features only when appropriate and for protecting the pairing token.
+
+3. No Unlawful Or Unauthorized Use
+You may not use the software to access, control, or interfere with devices you do not own or have permission to control.
+
+4. Security Responsibility
+You are responsible for keeping your device secure, protecting local access to the app, and rotating the pairing token if you believe it has been exposed.
+
+5. Updates
+[Publisher Name] may provide updates, fixes, or security patches at its discretion.
+
+6. Disclaimer
+THE SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTIES OF ANY KIND, TO THE MAXIMUM EXTENT PERMITTED BY LAW.
+
+7. Limitation Of Liability
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, [Publisher Name] WILL NOT BE LIABLE FOR INDIRECT, INCIDENTAL, SPECIAL, OR CONSEQUENTIAL DAMAGES.
+
+8. Termination
+This license terminates automatically if you violate these terms.
+
+9. Contact
+[Publisher Name]
+[Support Email]
+[Website]

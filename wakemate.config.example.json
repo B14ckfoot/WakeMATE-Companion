@@ -1,0 +1,13 @@
+{
+  "bind_address": "0.0.0.0:7777",
+  "discovery_port": 41234,
+  "discovery_message": "wakemate:discover",
+  "api_token": "replace-this-with-a-secret-token",
+  "device_name": "WakeMATE Companion",
+  "launch_on_startup": true,
+  "allow_input_commands": false,
+  "allow_power_commands": false,
+  "allow_remote_connections": false,
+  "allow_discovery": false,
+  "require_auth_for_info": true
+}

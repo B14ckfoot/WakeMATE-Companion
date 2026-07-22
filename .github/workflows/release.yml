@@ -1,0 +1,107 @@
+name: Release
+
+# Triggered by pushing a version tag, e.g. `git tag v1.0.0 && git push origin v1.0.0`.
+# This builds artifacts and stages a DRAFT GitHub release -- drafts are not
+# public and are not visible to anyone but repository collaborators until a
+# maintainer explicitly clicks "Publish release". Nothing here publishes
+# automatically; that is a deliberate choice, not an oversight.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Build Windows artifact
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo test
+        run: cargo test --release --locked
+
+      - name: Build release binary
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\build-release.ps1
+
+      - name: Find Inno Setup (or install it)
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+
+      - name: Build installer
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\build-installer.ps1 -SkipPrereqCheck
+
+      - name: Checksum
+        shell: pwsh
+        run: |
+          Get-FileHash "dist\installer\WakeMATE+Companion+Setup.exe" -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash)  WakeMATE-Companion-Setup.exe" } |
+            Out-File -Encoding ascii dist\installer\WakeMATE-Companion-Setup.exe.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: |
+            dist/installer/WakeMATE+Companion+Setup.exe
+            dist/installer/WakeMATE-Companion-Setup.exe.sha256
+          if-no-files-found: error
+
+  macos:
+    name: Build macOS artifact (unsigned)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo test
+        run: cargo test --release --locked
+
+      - name: cargo build --release
+        run: cargo build --release --locked
+
+      - name: Package unsigned .dmg
+        run: |
+          chmod +x installer/macos/package-macos.sh
+          ./installer/macos/package-macos.sh
+
+      - name: Checksum
+        run: |
+          shasum -a 256 dist/macos/*.dmg > dist/macos/checksums.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg-unsigned
+          path: |
+            dist/macos/*.dmg
+            dist/macos/checksums.sha256
+          if-no-files-found: error
+
+  draft-release:
+    name: Stage draft GitHub release
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create draft release (not published)
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            artifacts/windows-installer/*
+            artifacts/macos-dmg-unsigned/*

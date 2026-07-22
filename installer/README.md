@@ -38,4 +38,16 @@ Sign both:
 - `wakemate-companion.exe`
 - the generated installer `.exe`
 
-Authenticode signing is strongly recommended before public distribution.
+Authenticode signing is strongly recommended before public distribution. See `docs/RELEASE_CHECKLIST.md` for exactly what a signing certificate purchase/setup involves.
+
+## Windows Authenticode Signing (once you have a certificate)
+
+1. Obtain a code-signing certificate from a public CA (e.g. DigiCert, Sectigo) or your organization's internal PKI -- either an OV (`.pfx`/hardware token) or EV certificate. EV certificates build SmartScreen reputation faster but require a hardware token and stricter identity verification.
+2. Uncomment and fill in the `SignTool` line already present (commented out) in `wakemate-companion.iss`:
+   `SignTool=signtool.exe sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $f`
+3. In CI, store the certificate (base64-encoded `.pfx`) and its password as GitHub Actions repository secrets, decode it to a temp file in the workflow, and pass its path/password to `signtool` -- never commit a certificate or password to the repository.
+4. Without a certificate, the installer and `.exe` from this pipeline are **unsigned**. Windows SmartScreen will show an "Unknown publisher" warning on first run until enough installs build reputation (for OV certs) or immediately trust it (for EV certs). This is expected and disclosed, not a bug.
+
+## macOS Packaging
+
+See `installer/macos/package-macos.sh` and `docs/MACOS_BUILD.md` -- macOS packaging today produces an **unsigned, non-notarized** `.dmg` of the current headless-service build; there is no tray/pairing UI on macOS yet and no Apple Developer signing credentials configured in this repository.

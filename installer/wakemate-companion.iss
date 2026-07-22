@@ -52,8 +52,8 @@ Filename: "{app}\{#MyAppExeName}"; Parameters: "--prepare-install-config"; Statu
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch WakeMATE Companion"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""WakeMATE Companion Server"" /F"; Flags: runhidden skipifdoesntexist
-Filename: "{sys}\reg.exe"; Parameters: "delete ""HKCU\Software\Microsoft\Windows\CurrentVersion\Run"" /v ""WakeMATE Companion"" /f"; Flags: runhidden skipifdoesntexist
+Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""WakeMATE Companion Server"" /F"; Flags: runhidden skipifdoesntexist; RunOnceId: "RemoveBootTask"
+Filename: "{sys}\reg.exe"; Parameters: "delete ""HKCU\Software\Microsoft\Windows\CurrentVersion\Run"" /v ""WakeMATE Companion"" /f"; Flags: runhidden skipifdoesntexist; RunOnceId: "RemoveStartupRegistration"
 
 [Code]
 function IsVCRedistInstalled: Boolean;

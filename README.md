@@ -93,6 +93,16 @@ Mouse click:
 }
 ```
 
+Mouse button hold or release:
+
+```json
+{
+  "type": "mouse_button",
+  "button": "left",
+  "action": "down"
+}
+```
+
 Keyboard combo:
 
 ```json

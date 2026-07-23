@@ -1,5 +1,8 @@
 use std::{
-    env, fs, io,
+    env, fs,
+    fs::OpenOptions,
+    io,
+    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -69,17 +72,47 @@ impl AppConfig {
     }
 
     pub fn load_or_create_from_path(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut config = if path.exists() {
-            let raw = fs::read_to_string(path)?;
-            let mut config: Self = serde_json::from_str(&raw)?;
-            config.normalize();
-            config
-        } else {
-            Self::default()
+        let (mut config, recovered_from_error) = match fs::read_to_string(path) {
+            Ok(raw) => match serde_json::from_str::<Self>(&raw) {
+                Ok(mut config) => {
+                    config.normalize();
+                    (config, false)
+                }
+                Err(error) => {
+                    warn!(
+                        %error,
+                        path = %path.display(),
+                        "WakeMATE config file is corrupt; resetting to defaults"
+                    );
+                    (Self::default(), true)
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (Self::default(), false),
+            Err(error) => {
+                // An unreadable config must not be a fatal startup error:
+                // this binary has no console to report one. Use defaults
+                // even if the repair write below also fails.
+                warn!(
+                    %error,
+                    path = %path.display(),
+                    "WakeMATE config file is unreadable; resetting to defaults"
+                );
+                (Self::default(), true)
+            }
         };
 
         config.hydrate_token();
-        config.save_to_path(path)?;
+        if let Err(error) = config.save_to_path(path) {
+            if recovered_from_error {
+                warn!(
+                    %error,
+                    path = %path.display(),
+                    "WakeMATE could not replace the unreadable config; continuing with in-memory defaults"
+                );
+            } else {
+                return Err(error);
+            }
+        }
         Ok(config)
     }
 
@@ -150,7 +183,30 @@ impl AppConfig {
         }
 
         let json = serde_json::to_string_pretty(&on_disk)?;
-        fs::write(path, json)?;
+
+        // Write and flush a uniquely named sibling before atomically replacing
+        // the real config. A killed process can leave an incomplete temp file,
+        // but it cannot truncate the last valid config or collide with another
+        // process that is starting at the same time.
+        let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+        tmp_name.push(format!(".{}.tmp", Uuid::new_v4()));
+        let tmp_path = path.with_file_name(tmp_name);
+
+        let write_result = (|| -> io::Result<()> {
+            let mut tmp_file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
+            tmp_file.write_all(json.as_bytes())?;
+            tmp_file.sync_all()?;
+            drop(tmp_file);
+            fs::rename(&tmp_path, path)
+        })();
+
+        if write_result.is_err() {
+            let _ = fs::remove_file(&tmp_path);
+        }
+        write_result?;
         Ok(())
     }
 
@@ -294,7 +350,7 @@ fn home_dir() -> io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, TokenStorage};
+    use super::{AppConfig, TokenStorage, DEFAULT_BIND_ADDRESS};
     use crate::credential_store;
 
     #[test]
@@ -374,6 +430,47 @@ mod tests {
         let on_disk: serde_json::Value = serde_json::from_str(&raw).unwrap();
 
         assert_eq!(on_disk["api_token"], "");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_or_create_from_path_recovers_from_a_zero_filled_config_file() {
+        let dir =
+            std::env::temp_dir().join(format!("wakemate-config-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wakemate.config.json");
+        std::fs::write(&path, vec![0u8; 379]).unwrap();
+
+        let config = AppConfig::load_or_create_from_path(&path).unwrap();
+
+        assert_eq!(config.bind_address, DEFAULT_BIND_ADDRESS);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(&raw).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_to_path_atomically_replaces_an_existing_config() {
+        let mut config = AppConfig::default();
+        let dir =
+            std::env::temp_dir().join(format!("wakemate-config-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("wakemate.config.json");
+
+        config.save_to_path(&path).unwrap();
+        config.allow_remote_connections = true;
+        config.save_to_path(&path).unwrap();
+
+        let saved: AppConfig =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.allow_remote_connections);
+        let leftover_temp_file = std::fs::read_dir(&dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("wakemate.config.json.")
+        });
+        assert!(!leftover_temp_file);
         std::fs::remove_dir_all(&dir).ok();
     }
 

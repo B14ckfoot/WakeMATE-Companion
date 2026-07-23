@@ -3,6 +3,7 @@
 mod app;
 mod config;
 mod credential_store;
+mod devices;
 mod discovery;
 mod error;
 mod input;
@@ -33,6 +34,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use crate::{
     app::{router, AppState},
     config::{AppConfig, SharedConfig},
+    devices::{DeviceRegistry, SharedDeviceRegistry},
     pairing::PairingCoordinator,
     tls::TlsIdentity,
 };
@@ -134,7 +136,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // No desktop confirmation surface exists on this platform yet, so
         // pairing activation is refused rather than silently auto-approved.
         let pairing = Arc::new(PairingCoordinator::unavailable());
-        runtime.block_on(run_server(config, pairing, false, shutdown_signal()))?;
+        let registry: SharedDeviceRegistry =
+            Arc::new(Mutex::new(DeviceRegistry::load_or_default()));
+        runtime.block_on(run_server(
+            config,
+            pairing,
+            registry,
+            false,
+            shutdown_signal(),
+        ))?;
         Ok(())
     }
 }
@@ -151,6 +161,7 @@ fn init_tracing() {
 pub(crate) async fn run_server<F>(
     config: SharedConfig,
     pairing: Arc<PairingCoordinator>,
+    registry: SharedDeviceRegistry,
     headless: bool,
     shutdown: F,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -192,7 +203,7 @@ where
         None
     };
 
-    let state = AppState::new(config, pairing, headless);
+    let state = AppState::new(config, pairing, registry, headless);
     let tls_handle = axum_server::Handle::new();
     let shutdown_tls_handle = tls_handle.clone();
     let (http_shutdown_tx, http_shutdown_rx) = watch::channel(false);
@@ -321,10 +332,14 @@ fn run_headless_server(config_path: std::path::PathBuf) -> Result<(), Box<dyn st
     // The pre-logon service runs with no interactive desktop session, so
     // there is nobody who could approve a pairing prompt or receive
     // injected input; both are refused unconditionally (see AppState).
+    // Already-approved per-device tokens still authenticate here so a
+    // paired phone can check status and send wake packets before sign-in.
     let pairing = Arc::new(PairingCoordinator::unavailable());
+    let registry: SharedDeviceRegistry = Arc::new(Mutex::new(DeviceRegistry::load_or_default()));
     runtime.block_on(run_server(
         config,
         pairing,
+        registry,
         true,
         std::future::pending::<()>(),
     ))?;

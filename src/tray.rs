@@ -15,7 +15,7 @@ use softbuffer::{Context as SoftbufferContext, Surface as SoftbufferSurface};
 use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 use tray_icon::{
-    menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem},
+    menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu},
     Icon, Rect as TrayRect, TrayIcon, TrayIconBuilder,
 };
 use winit::{
@@ -31,10 +31,13 @@ use winit::{
 
 use crate::{
     config::{AppConfig, SharedConfig},
-    pairing::{PairingCoordinator, PairingRequestInfo},
+    devices::{DeviceRegistry, PairedDevice, SharedDeviceRegistry},
+    pairing::{NotifierContext, PairingCoordinator},
     run_server, system, theme,
     tls::TlsIdentity,
 };
+
+use std::sync::Mutex as StdMutex;
 
 const POPUP_LOGICAL_WIDTH: f64 = 280.0;
 const POPUP_LOGICAL_HEIGHT: f64 = 336.0;
@@ -49,7 +52,8 @@ pub fn run(config: SharedConfig) -> Result<(), Box<dyn std::error::Error>> {
     let assets_dir = AppConfig::asset_dir()?;
     std::fs::create_dir_all(&assets_dir)?;
 
-    let mut app = TrayApp::new(config, assets_dir)?;
+    let registry: SharedDeviceRegistry = Arc::new(StdMutex::new(DeviceRegistry::load_or_default()));
+    let mut app = TrayApp::new(config, registry, assets_dir)?;
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
 
@@ -70,18 +74,28 @@ fn forward_menu_events(
 
 struct TrayApp {
     config: SharedConfig,
+    registry: SharedDeviceRegistry,
     assets_dir: PathBuf,
     server: ServerThread,
     tray_icon: Option<TrayIcon>,
     pairing_popup: Option<PairingPopup>,
     tray_menu: Option<TrayMenu>,
+    /// Menu id -> paired device id, rebuilt with the submenu.
+    device_menu_ids: Vec<(MenuId, String)>,
+    /// Snapshot backing change detection for the submenu rebuild; `None`
+    /// until the submenu has been populated once.
+    last_device_list: Option<Vec<PairedDevice>>,
     startup_error: Option<String>,
     next_config_poll: Instant,
     last_config_modified: Option<SystemTime>,
 }
 
 impl TrayApp {
-    fn new(config: SharedConfig, assets_dir: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(
+        config: SharedConfig,
+        registry: SharedDeviceRegistry,
+        assets_dir: PathBuf,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let snapshot = config_snapshot(&config)?;
         let existing_listener = system::server_is_reachable(&snapshot.effective_bind_address())
             || system::server_is_reachable(&snapshot.effective_tls_bind_address());
@@ -93,16 +107,19 @@ impl TrayApp {
             );
             ServerThread::inactive()
         } else {
-            ServerThread::spawn(config.clone())?
+            ServerThread::spawn(config.clone(), registry.clone())?
         };
 
         Ok(Self {
             config: config.clone(),
+            registry,
             assets_dir,
             server,
             tray_icon: None,
             pairing_popup: None,
             tray_menu: None,
+            device_menu_ids: Vec::new(),
+            last_device_list: None,
             startup_error: None,
             next_config_poll: Instant::now() + CONFIG_POLL_INTERVAL,
             last_config_modified: config_modified_time()?,
@@ -114,6 +131,7 @@ impl TrayApp {
         let menu = Menu::new();
         let status = MenuItem::new(self.status_label(), false, None);
         let show_pairing_qr = MenuItem::new("View Pairing QR Code", true, None);
+        let paired_devices = Submenu::new("Paired Devices", true);
         let rotate_pairing_token = MenuItem::new("Rotate Pairing Token", true, None);
         let launch_on_startup = CheckMenuItem::new(
             "Launch on Windows Startup",
@@ -131,6 +149,7 @@ impl TrayApp {
         let tray_menu = TrayMenu {
             status: status.clone(),
             launch_on_startup: launch_on_startup.clone(),
+            paired_devices: paired_devices.clone(),
             ids: MenuIds {
                 show_pairing_qr: show_pairing_qr.id().clone(),
                 rotate_pairing_token: rotate_pairing_token.id().clone(),
@@ -144,6 +163,7 @@ impl TrayApp {
         menu.append(&status)?;
         menu.append(&separator_top)?;
         menu.append(&show_pairing_qr)?;
+        menu.append(&paired_devices)?;
         menu.append(&rotate_pairing_token)?;
         menu.append(&launch_on_startup)?;
         menu.append(&separator_middle)?;
@@ -163,7 +183,45 @@ impl TrayApp {
         self.tray_menu = Some(tray_menu);
         self.tray_icon = Some(tray_icon);
         self.refresh_tray_state()?;
+        self.refresh_paired_devices_menu()?;
         info!(assets = %self.assets_dir.display(), "WakeMATE tray icon ready");
+        Ok(())
+    }
+
+    /// Rebuilds the "Paired Devices" submenu when the registry changed
+    /// (a new approval from the notifier thread, or a revocation here).
+    fn refresh_paired_devices_menu(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let devices = self
+            .registry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .list();
+
+        if self.last_device_list.as_ref() == Some(&devices) {
+            return Ok(());
+        }
+
+        let Some(tray_menu) = &self.tray_menu else {
+            return Ok(());
+        };
+
+        while tray_menu.paired_devices.remove_at(0).is_some() {}
+        self.device_menu_ids.clear();
+
+        if devices.is_empty() {
+            let placeholder = MenuItem::new("No phones paired yet", false, None);
+            tray_menu.paired_devices.append(&placeholder)?;
+        } else {
+            for device in &devices {
+                let label = format!("Revoke \"{}\"", popup_device_label(&device.name, 32));
+                let item = MenuItem::new(label, true, None);
+                tray_menu.paired_devices.append(&item)?;
+                self.device_menu_ids
+                    .push((item.id().clone(), device.id.clone()));
+            }
+        }
+
+        self.last_device_list = Some(devices);
         Ok(())
     }
 
@@ -268,8 +326,56 @@ impl TrayApp {
         } else if event.id == quit {
             info!("WakeMATE quit requested from tray");
             event_loop.exit();
+        } else if let Some(device_id) = self
+            .device_menu_ids
+            .iter()
+            .find(|(menu_id, _)| *menu_id == event.id)
+            .map(|(_, device_id)| device_id.clone())
+        {
+            self.revoke_paired_device(&device_id)?;
         }
 
+        Ok(())
+    }
+
+    fn revoke_paired_device(&mut self, device_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let device_name = self
+            .registry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .list()
+            .into_iter()
+            .find(|device| device.id == device_id)
+            .map(|device| device.name);
+
+        let Some(device_name) = device_name else {
+            self.refresh_paired_devices_menu()?;
+            return Ok(());
+        };
+
+        let confirmed = system::confirm_dialog(
+            "Revoke this phone?",
+            &format!(
+                "\"{device_name}\" will immediately lose remote access to this computer and \
+                 will need to scan the pairing QR code again to reconnect.\n\nRevoke it?",
+            ),
+        );
+
+        if !confirmed {
+            return Ok(());
+        }
+
+        let removed = self
+            .registry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .revoke(device_id);
+
+        if let Some(removed) = removed {
+            info!(device = %removed.name, "WakeMATE paired phone revoked from the tray");
+        }
+
+        self.refresh_paired_devices_menu()?;
         Ok(())
     }
 
@@ -288,6 +394,10 @@ impl TrayApp {
         }
 
         self.pairing_popup = None;
+        self.registry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .revoke_all();
         let restart_needed = {
             let mut config = self
                 .config
@@ -306,8 +416,10 @@ impl TrayApp {
         }
 
         self.refresh_tray_state()?;
+        self.refresh_paired_devices_menu()?;
         if restart_needed {
-            self.server.restart(self.config.clone())?;
+            self.server
+                .restart(self.config.clone(), self.registry.clone())?;
         }
         info!("WakeMATE Companion was reset to defaults from the tray");
         Ok(())
@@ -375,9 +487,17 @@ impl TrayApp {
             new_token
         };
 
+        // Rotation keeps its documented "revokes every phone at once"
+        // semantics: per-device tokens die together with the QR token.
+        self.registry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .revoke_all();
+
         self.pairing_popup = None;
         self.refresh_tray_state()?;
-        info!("WakeMATE pairing token rotated");
+        self.refresh_paired_devices_menu()?;
+        info!("WakeMATE pairing token rotated; all paired phones revoked");
         info!(token_length = new_token.len(), "new pairing token saved");
         Ok(())
     }
@@ -420,7 +540,8 @@ impl TrayApp {
                 discovery_enabled = reloaded_server.discovery_enabled,
                 "WakeMATE config changed on disk, restarting server"
             );
-            self.server.restart(self.config.clone())?;
+            self.server
+                .restart(self.config.clone(), self.registry.clone())?;
         } else {
             info!("WakeMATE config changed on disk, reloaded in memory");
         }
@@ -503,6 +624,11 @@ impl ApplicationHandler<UserEvent> for TrayApp {
             if let Err(error) = self.reload_config_if_changed() {
                 error!(error = %error, "failed to reload config changes from disk");
             }
+            // Approvals land on the notifier thread; pick them up here so
+            // the "Paired Devices" submenu stays current.
+            if let Err(error) = self.refresh_paired_devices_menu() {
+                error!(error = %error, "failed to refresh the paired-devices menu");
+            }
             self.next_config_poll = Instant::now() + CONFIG_POLL_INTERVAL;
         }
 
@@ -548,6 +674,7 @@ struct MenuIds {
 struct TrayMenu {
     status: MenuItem,
     launch_on_startup: CheckMenuItem,
+    paired_devices: Submenu,
     ids: MenuIds,
 }
 
@@ -1281,7 +1408,10 @@ impl ServerThread {
         }
     }
 
-    fn spawn(config: SharedConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    fn spawn(
+        config: SharedConfig,
+        registry: SharedDeviceRegistry,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let pairing = Arc::new(PairingCoordinator::new(Some(Arc::new(
             windows_pairing_notifier,
@@ -1295,7 +1425,7 @@ impl ServerThread {
 
             runtime
                 .block_on(async move {
-                    run_server(config, pairing, false, async move {
+                    run_server(config, pairing, registry, false, async move {
                         let _ = shutdown_rx.await;
                     })
                     .await
@@ -1319,12 +1449,16 @@ impl ServerThread {
         }
     }
 
-    fn restart(&mut self, config: SharedConfig) -> Result<(), Box<dyn std::error::Error>> {
+    fn restart(
+        &mut self,
+        config: SharedConfig,
+        registry: SharedDeviceRegistry,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         if !self.active {
             return Ok(());
         }
         self.finish()?;
-        *self = Self::spawn(config)?;
+        *self = Self::spawn(config, registry)?;
         Ok(())
     }
 
@@ -1415,18 +1549,42 @@ fn pairing_qr_payload_from_parts(
     payload.to_string()
 }
 
-fn windows_pairing_notifier(
-    info: PairingRequestInfo,
-    config: SharedConfig,
-    status: Arc<crate::pairing::PairingStatusHandle>,
-) {
+fn windows_pairing_notifier(context: NotifierContext) {
     thread::spawn(move || {
-        let approved = system::confirm_pairing_dialog(&info.peer.to_string());
+        let NotifierContext {
+            info,
+            config,
+            status,
+            enrollment,
+            registry,
+        } = context;
+
+        let device_hint = enrollment
+            .pending_device_name()
+            .map(|name| format!("\"{name}\" (at {})", info.peer))
+            .unwrap_or_else(|| info.peer.to_string());
+
+        let approved = system::confirm_pairing_dialog(&device_hint);
         status.record_outcome(approved);
 
         if !approved {
+            enrollment.clear();
             info!(peer = %info.peer, "WakeMATE pairing request denied on the desktop");
             return;
+        }
+
+        // Commit the enrollment (if this prompt was for one) so the phone's
+        // per-device token starts authenticating.
+        if let Some(pending) = enrollment.take_valid() {
+            registry
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .register_with_id(&pending.device_id, &pending.device_name, &pending.token);
+            info!(
+                device = %pending.device_name,
+                peer = %info.peer,
+                "WakeMATE registered a paired phone with its own token"
+            );
         }
 
         let outcome = (|| -> Result<(), Box<dyn std::error::Error>> {

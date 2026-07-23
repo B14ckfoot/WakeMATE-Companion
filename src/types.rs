@@ -6,8 +6,10 @@ pub const AUTH_HEADER: &str = "x-wakemate-token";
 /// payload, discovery reply). Bump on any breaking change so the mobile app
 /// can detect an incompatible companion instead of failing mid-command.
 /// History: 1 = implicit pre-versioning protocol; 2 = adds `mouse_button`,
-/// `/v1/pairing/status`, the JSON pairing-QR payload, and this field itself.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// `/v1/pairing/status`, the JSON pairing-QR payload, and this field itself;
+/// 3 = adds `/v1/pairing/enroll` per-device tokens and the `device_id` query
+/// on `/v1/pairing/status`.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Serialize)]
 pub struct ApiResponse<T: Serialize> {
@@ -110,6 +112,30 @@ pub struct PairingStatusResponse {
     pub approval: &'static str,
     pub allow_input_commands: bool,
     pub allow_power_commands: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EnrollRequest {
+    /// Friendly name the phone reports for itself, shown in the desktop
+    /// approval prompt and the tray's paired-device list.
+    pub device_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EnrollResponse {
+    pub device_id: String,
+    /// The per-device secret. Returned exactly once, over the (ideally
+    /// pinned-TLS) enrollment response; the companion stores only its hash,
+    /// and it authenticates nothing until the desktop approves.
+    pub device_token: String,
+    pub status: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PairingStatusQuery {
+    /// When set, report the approval state of this specific enrollment
+    /// instead of the process-wide legacy state.
+    pub device_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

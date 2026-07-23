@@ -6,13 +6,18 @@ use std::{
 
 use tracing::info;
 
-use crate::config::SharedConfig;
+use crate::{config::SharedConfig, devices::SharedDeviceRegistry};
 
 /// Minimum time between desktop confirmation prompts. A device that already
 /// holds a valid token can still hammer `/v1/pairing/activate`; this keeps
 /// that from turning into a notification-spam nuisance (or a way to bury a
 /// legitimate prompt under repeats) without needing a full session concept.
 const PROMPT_COOLDOWN: Duration = Duration::from_secs(10);
+
+/// How long a pending enrollment stays claimable. If nobody answers the
+/// desktop prompt within this window, approving a *later* prompt must not
+/// silently register the stale device.
+const ENROLLMENT_TTL: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Copy)]
 pub struct PairingRequestInfo {
@@ -24,10 +29,97 @@ pub enum PairingOutcome {
     /// A confirmation prompt was shown (or a very recent one is still
     /// outstanding); the phone should treat this as "ask again shortly".
     AwaitingApproval,
+    /// An enrollment was requested while another prompt is still on screen
+    /// (or inside the prompt cooldown). The phone should retry shortly;
+    /// nothing was queued, so the visible prompt cannot grant the wrong
+    /// device.
+    Busy,
     /// No desktop confirmation surface is available in this run mode (for
     /// example the pre-logon headless service, which has no interactive
     /// session to prompt). Pairing must be completed from the tray app.
     Unavailable,
+}
+
+/// A device that has requested enrollment and is waiting for the person at
+/// the desktop to answer the prompt. The token was already returned to the
+/// phone; it becomes valid only if this record is committed to the registry
+/// by an explicit "Yes".
+#[derive(Debug, Clone)]
+pub struct PendingEnrollment {
+    pub device_id: String,
+    pub device_name: String,
+    pub token: String,
+    pub requested_at: Instant,
+}
+
+impl PendingEnrollment {
+    pub fn new(device_name: String) -> Self {
+        Self {
+            device_id: uuid::Uuid::new_v4().to_string(),
+            device_name,
+            token: uuid::Uuid::new_v4().to_string(),
+            requested_at: Instant::now(),
+        }
+    }
+
+    fn expired(&self) -> bool {
+        self.requested_at.elapsed() > ENROLLMENT_TTL
+    }
+}
+
+/// Holds at most one unanswered enrollment. Shared between the coordinator
+/// (which fills it when a prompt is shown), the platform notifier (which
+/// takes it on "Yes" / clears it on "No"), and the status endpoint (which
+/// reports whether a given device id is still pending).
+#[derive(Default)]
+pub struct EnrollmentSlot {
+    slot: Mutex<Option<PendingEnrollment>>,
+}
+
+impl EnrollmentSlot {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<PendingEnrollment>> {
+        self.slot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn set(&self, pending: PendingEnrollment) {
+        *self.lock() = Some(pending);
+    }
+
+    pub fn clear(&self) {
+        *self.lock() = None;
+    }
+
+    /// Takes the pending enrollment if it has not expired. An expired entry
+    /// is discarded either way.
+    pub fn take_valid(&self) -> Option<PendingEnrollment> {
+        let pending = self.lock().take()?;
+        if pending.expired() {
+            None
+        } else {
+            Some(pending)
+        }
+    }
+
+    /// Device name for the desktop prompt, if an enrollment is waiting.
+    pub fn pending_device_name(&self) -> Option<String> {
+        let guard = self.lock();
+        guard
+            .as_ref()
+            .filter(|pending| !pending.expired())
+            .map(|pending| pending.device_name.clone())
+    }
+
+    /// Whether the given device id is the one currently awaiting approval.
+    pub fn holds(&self, device_id: &str) -> bool {
+        let guard = self.lock();
+        guard
+            .as_ref()
+            .filter(|pending| !pending.expired())
+            .map(|pending| pending.device_id == device_id)
+            .unwrap_or(false)
+    }
 }
 
 /// Where the most recent pairing-activation prompt stands, so the phone can
@@ -86,7 +178,19 @@ impl PairingStatusHandle {
     }
 }
 
-type Notifier = dyn Fn(PairingRequestInfo, SharedConfig, Arc<PairingStatusHandle>) + Send + Sync;
+/// Everything the platform-specific approval UI needs: the request origin,
+/// live config (to persist granted capabilities), the status handle (to
+/// record the human's answer), the enrollment slot (to commit or discard the
+/// pending device), and the registry (where a committed device lands).
+pub struct NotifierContext {
+    pub info: PairingRequestInfo,
+    pub config: SharedConfig,
+    pub status: Arc<PairingStatusHandle>,
+    pub enrollment: Arc<EnrollmentSlot>,
+    pub registry: SharedDeviceRegistry,
+}
+
+type Notifier = dyn Fn(NotifierContext) + Send + Sync;
 
 /// Bridges the HTTP pairing-activation handler (which must respond quickly)
 /// to whatever platform-specific "Approve this device?" UI is available, if
@@ -96,6 +200,7 @@ type Notifier = dyn Fn(PairingRequestInfo, SharedConfig, Arc<PairingStatusHandle
 pub struct PairingCoordinator {
     notifier: Option<Arc<Notifier>>,
     status: Arc<PairingStatusHandle>,
+    enrollment: Arc<EnrollmentSlot>,
     last_prompt_at: Mutex<Option<Instant>>,
 }
 
@@ -104,6 +209,7 @@ impl PairingCoordinator {
         Self {
             notifier,
             status: Arc::new(PairingStatusHandle::default()),
+            enrollment: Arc::new(EnrollmentSlot::default()),
             last_prompt_at: Mutex::new(None),
         }
     }
@@ -118,7 +224,23 @@ impl PairingCoordinator {
         self.status.get()
     }
 
-    pub fn request(&self, info: PairingRequestInfo, config: SharedConfig) -> PairingOutcome {
+    /// Whether the given device id is the enrollment currently awaiting the
+    /// desktop's answer.
+    pub fn enrollment_pending_for(&self, device_id: &str) -> bool {
+        self.enrollment.holds(device_id)
+    }
+
+    /// Shows the desktop approval prompt. With `pending: Some(...)` this is
+    /// a per-device enrollment; the pending record is queued only when a
+    /// prompt is actually shown, so an on-screen prompt can never grant a
+    /// device the person was not asked about.
+    pub fn request(
+        &self,
+        info: PairingRequestInfo,
+        config: SharedConfig,
+        registry: SharedDeviceRegistry,
+        pending: Option<PendingEnrollment>,
+    ) -> PairingOutcome {
         let Some(notifier) = self.notifier.clone() else {
             return PairingOutcome::Unavailable;
         };
@@ -133,13 +255,30 @@ impl PairingCoordinator {
             .map(|previous| now.duration_since(previous) >= PROMPT_COOLDOWN)
             .unwrap_or(true);
 
-        if should_prompt {
-            *last_prompt_at = Some(now);
-            drop(last_prompt_at);
-            self.status.set(ApprovalState::Pending);
-            info!(peer = %info.peer, "WakeMATE showing a pairing confirmation prompt on the desktop");
-            notifier(info, config, self.status.clone());
+        if !should_prompt {
+            return if pending.is_some() {
+                PairingOutcome::Busy
+            } else {
+                PairingOutcome::AwaitingApproval
+            };
         }
+
+        *last_prompt_at = Some(now);
+        drop(last_prompt_at);
+
+        if let Some(pending) = pending {
+            self.enrollment.set(pending);
+        }
+
+        self.status.set(ApprovalState::Pending);
+        info!(peer = %info.peer, "WakeMATE showing a pairing confirmation prompt on the desktop");
+        notifier(NotifierContext {
+            info,
+            config,
+            status: self.status.clone(),
+            enrollment: self.enrollment.clone(),
+            registry,
+        });
 
         PairingOutcome::AwaitingApproval
     }
@@ -148,10 +287,20 @@ impl PairingCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AppConfig;
+    use crate::{config::AppConfig, devices::DeviceRegistry};
 
     fn shared_config() -> SharedConfig {
         Arc::new(Mutex::new(AppConfig::default()))
+    }
+
+    fn shared_registry() -> SharedDeviceRegistry {
+        Arc::new(Mutex::new(DeviceRegistry::default()))
+    }
+
+    fn request_info() -> PairingRequestInfo {
+        PairingRequestInfo {
+            peer: "192.168.1.20".parse().unwrap(),
+        }
     }
 
     #[test]
@@ -159,36 +308,120 @@ mod tests {
         let coordinator = PairingCoordinator::unavailable();
         assert_eq!(coordinator.approval_state(), ApprovalState::Idle);
 
-        let outcome = coordinator.request(
-            PairingRequestInfo {
-                peer: "127.0.0.1".parse().unwrap(),
-            },
-            shared_config(),
-        );
+        let outcome = coordinator.request(request_info(), shared_config(), shared_registry(), None);
         assert_eq!(outcome, PairingOutcome::Unavailable);
     }
 
     #[test]
     fn request_marks_pending_and_notifier_outcome_is_reported() {
-        let coordinator = PairingCoordinator::new(Some(Arc::new(
-            |_info, _config, status: Arc<PairingStatusHandle>| {
-                // The real notifier spawns a thread and records the human's
-                // answer later; recording synchronously here exercises the
-                // same path.
-                assert_eq!(status.get(), ApprovalState::Pending);
-                status.record_outcome(true);
-            },
-        )));
+        let coordinator = PairingCoordinator::new(Some(Arc::new(|context: NotifierContext| {
+            // The real notifier spawns a thread and records the human's
+            // answer later; recording synchronously here exercises the
+            // same path.
+            assert_eq!(context.status.get(), ApprovalState::Pending);
+            context.status.record_outcome(true);
+        })));
 
-        let outcome = coordinator.request(
-            PairingRequestInfo {
-                peer: "192.168.1.20".parse().unwrap(),
-            },
-            shared_config(),
-        );
+        let outcome = coordinator.request(request_info(), shared_config(), shared_registry(), None);
 
         assert_eq!(outcome, PairingOutcome::AwaitingApproval);
         assert_eq!(coordinator.approval_state(), ApprovalState::Approved);
+    }
+
+    #[test]
+    fn approved_enrollment_lands_in_the_registry() {
+        let coordinator = PairingCoordinator::new(Some(Arc::new(|context: NotifierContext| {
+            // Simulate the desktop user clicking "Yes".
+            let pending = context.enrollment.take_valid().expect("enrollment queued");
+            context.registry.lock().unwrap().register_with_id(
+                &pending.device_id,
+                &pending.device_name,
+                &pending.token,
+            );
+            context.status.record_outcome(true);
+        })));
+
+        let registry = shared_registry();
+        let pending = PendingEnrollment::new("Test Phone".to_string());
+        let device_id = pending.device_id.clone();
+        let device_token = pending.token.clone();
+
+        let outcome = coordinator.request(
+            request_info(),
+            shared_config(),
+            registry.clone(),
+            Some(pending),
+        );
+
+        assert_eq!(outcome, PairingOutcome::AwaitingApproval);
+        let registry = registry.lock().unwrap();
+        assert!(registry.contains(&device_id));
+        assert_eq!(registry.authenticate(&device_token), Some(device_id));
+    }
+
+    #[test]
+    fn denied_enrollment_is_discarded() {
+        let coordinator = PairingCoordinator::new(Some(Arc::new(|context: NotifierContext| {
+            context.enrollment.clear();
+            context.status.record_outcome(false);
+        })));
+
+        let registry = shared_registry();
+        let pending = PendingEnrollment::new("Test Phone".to_string());
+        let device_id = pending.device_id.clone();
+
+        coordinator.request(
+            request_info(),
+            shared_config(),
+            registry.clone(),
+            Some(pending),
+        );
+
+        assert_eq!(coordinator.approval_state(), ApprovalState::Denied);
+        assert!(!coordinator.enrollment_pending_for(&device_id));
+        assert!(registry.lock().unwrap().list().is_empty());
+    }
+
+    #[test]
+    fn enrollment_during_prompt_cooldown_reports_busy() {
+        let coordinator = PairingCoordinator::new(Some(Arc::new(|_context: NotifierContext| {
+            // Leave the prompt "unanswered" so the cooldown applies.
+        })));
+
+        let first = coordinator.request(
+            request_info(),
+            shared_config(),
+            shared_registry(),
+            Some(PendingEnrollment::new("Phone A".to_string())),
+        );
+        assert_eq!(first, PairingOutcome::AwaitingApproval);
+
+        let second = coordinator.request(
+            request_info(),
+            shared_config(),
+            shared_registry(),
+            Some(PendingEnrollment::new("Phone B".to_string())),
+        );
+        assert_eq!(second, PairingOutcome::Busy);
+
+        // A legacy activation retry inside the cooldown is still just
+        // "waiting", not an error.
+        let legacy = coordinator.request(request_info(), shared_config(), shared_registry(), None);
+        assert_eq!(legacy, PairingOutcome::AwaitingApproval);
+    }
+
+    #[test]
+    fn expired_enrollment_cannot_be_taken() {
+        let slot = EnrollmentSlot::default();
+        let mut pending = PendingEnrollment::new("Old Phone".to_string());
+        pending.requested_at = Instant::now()
+            .checked_sub(ENROLLMENT_TTL + Duration::from_secs(1))
+            .unwrap();
+        let device_id = pending.device_id.clone();
+        slot.set(pending);
+
+        assert!(!slot.holds(&device_id));
+        assert!(slot.take_valid().is_none());
     }
 
     #[test]

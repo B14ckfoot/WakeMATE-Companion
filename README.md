@@ -45,7 +45,8 @@ No terminal, runtime installation, config editing, or manual port setup is requi
 The tray icon's status line shows one of: `Server not running`, `Local only — not discoverable`, `Ready to pair`, `Paired — remote control enabled`, or an error. Tray actions:
 
 - **View Pairing QR Code** — pair another phone (any valid phone can also re-scan)
-- **Rotate Pairing Token** — immediately un-pairs **all** phones (there is no per-phone revocation yet)
+- **Paired Devices** — lists every phone that completed pairing, each with a one-click **Revoke** (with confirmation); a revoked phone loses access immediately and must re-scan the QR to reconnect
+- **Rotate Pairing Token** — immediately un-pairs **all** phones (the enrollment token rotates and every per-device token is revoked together)
 - **Launch on Windows Startup** — toggle
 - **Open Data Folder** — opens the config folder for troubleshooting
 - **Reset Companion…** — clears the token, all pairing/capability flags, and all local settings back to secure defaults (with confirmation)
@@ -82,7 +83,7 @@ See [docs/TROUBLESHOOTING.md](./docs/TROUBLESHOOTING.md). Quick checks: both dev
 Confirmed in the 2026-07-23 audit (items struck through were fixed the same day in protocol v2):
 
 - ~~No transport encryption~~ — fixed for current mobile builds with self-signed TLS and QR fingerprint pinning. The old HTTP listener is still available behind `allow_insecure_http` during the migration window.
-- **One shared token** — rotating it un-pairs every phone; per-device revocation is planned.
+- ~~One shared token / no per-device revocation~~ — fixed in protocol v3: each phone enrolls for its own token (only its SHA-256 hash is stored on the PC) and can be revoked individually from tray → **Paired Devices**. The QR token remains the enrollment credential; rotating it still revokes everything at once.
 - ~~Mouse drag/hold from the phone does not work~~ — fixed: the companion now implements the `mouse_button` down/up command.
 - ~~The mobile "Add device → Scan QR" screen can't read the companion's QR~~ — fixed: the QR now carries a JSON payload (name, IP, port, MAC, token) both mobile scanners understand.
 - ~~The phone reported pairing success before the desktop approved~~ — fixed: new `/v1/pairing/status` endpoint; the phone polls and reports approved/denied/waiting truthfully.

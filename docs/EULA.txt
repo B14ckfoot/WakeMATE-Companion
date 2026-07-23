@@ -1,0 +1,135 @@
+WakeMATE Companion End User License Agreement
+Effective date: July 23, 2026
+
+IMPORTANT: PLEASE READ THIS AGREEMENT CAREFULLY. BY INSTALLING, COPYING,
+OR USING WAKEMATE COMPANION, YOU AGREE TO THESE TERMS. IF YOU DO NOT
+AGREE, DO NOT INSTALL OR USE THE SOFTWARE.
+
+1. Parties and Software
+
+This End User License Agreement ("Agreement") is between you and Marco
+Macias ("Publisher") and governs your use of WakeMATE Companion
+("Software"). The Software connects a supported computer with the
+WakeMATE mobile application for local-network discovery, Wake-on-LAN,
+and approved remote-control features.
+
+2. License Grant
+
+Subject to this Agreement, Publisher grants you a limited, revocable,
+non-exclusive, non-transferable, and non-sublicensable license to
+install and use the Software on computers that you own or are expressly
+authorized to administer. This license is for your personal use or your
+organization's internal use. The Software is licensed, not sold.
+
+3. Ownership and Third-Party Components
+
+Publisher and its licensors retain all right, title, and interest in the
+Software except for the limited license granted above. The Software may
+include third-party components governed by their own license terms.
+Those terms are identified in the third-party notices distributed with
+the Software and control only for the applicable components.
+
+4. Authorized Remote Control
+
+The Software can accept commands from a paired device, including wake,
+mouse, keyboard, media, lock, sleep, restart, and shutdown commands.
+You may use these features only on a computer that you own or have
+explicit permission to control. You must not use the Software to access,
+monitor, disrupt, damage, or control another person's device without
+authorization, or for any unlawful purpose.
+
+5. Security Responsibilities
+
+You are responsible for:
+
+- approving pairing requests only when you initiated them;
+- protecting your phone, computer, pairing QR code, and pairing
+  credentials from unauthorized access;
+- keeping the Software and WakeMATE mobile application updated;
+- revoking paired devices or rotating credentials after suspected
+  exposure; and
+- using the Software only on networks and devices appropriate for
+  remote-control access.
+
+No security control eliminates all risk. Remote input and power commands
+can interrupt work or cause loss of unsaved data. You are responsible
+for saving your work, maintaining appropriate backups, and supervising
+use of these features.
+
+6. Restrictions
+
+Except where applicable law expressly permits it, you may not:
+
+- copy, modify, distribute, sell, lease, sublicense, or commercially
+  exploit the Software;
+- reverse engineer, decompile, or attempt to derive the Software's
+  source code;
+- bypass or disable authentication, certificate validation, pairing
+  approval, rate limits, or other security controls;
+- remove copyright, trademark, or other proprietary notices; or
+- use the Software in a way that violates law or the rights of others.
+
+7. Updates, Availability, and Changes
+
+Publisher may provide updates, security fixes, feature changes, or
+discontinue support at its discretion. Some updates may be required for
+compatibility or security. Publisher does not guarantee that the
+Software will always be available, error-free, or compatible with every
+device, operating-system version, firewall, router, or network.
+
+8. Privacy and Local Data
+
+The Software is designed to communicate directly over your local
+network and does not require a WakeMATE cloud account. It stores
+configuration, pairing, and security data locally on your devices.
+Operating systems, app stores, download hosts, or other third-party
+services may process data under their own terms and privacy policies.
+See https://wakematemobile.com for current product and privacy
+information.
+
+9. Disclaimer of Warranties
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE SOFTWARE IS
+PROVIDED "AS IS" AND "AS AVAILABLE," WITH ALL FAULTS AND WITHOUT
+WARRANTIES OF ANY KIND. PUBLISHER DISCLAIMS ALL EXPRESS, IMPLIED, AND
+STATUTORY WARRANTIES, INCLUDING WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, TITLE, NON-INFRINGEMENT, QUIET ENJOYMENT,
+ACCURACY, SECURITY, AND RELIABILITY. NOTHING IN THIS AGREEMENT EXCLUDES
+RIGHTS OR WARRANTIES THAT CANNOT LAWFULLY BE EXCLUDED.
+
+10. Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, PUBLISHER AND ITS
+LICENSORS WILL NOT BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL,
+CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE DAMAGES; LOSS OF DATA, PROFITS,
+REVENUE, BUSINESS, OR GOODWILL; DEVICE OR NETWORK INTERRUPTION; OR
+UNAUTHORIZED ACCESS ARISING FROM OR RELATED TO THE SOFTWARE, EVEN IF
+ADVISED THAT SUCH DAMAGES ARE POSSIBLE. PUBLISHER'S TOTAL LIABILITY FOR
+ALL CLAIMS RELATING TO THE SOFTWARE WILL NOT EXCEED THE GREATER OF THE
+AMOUNT YOU PAID FOR THE SOFTWARE OR US$10. THESE LIMITATIONS APPLY TO
+THE FULLEST EXTENT PERMITTED BY LAW.
+
+11. Termination
+
+This Agreement remains effective until terminated. Your license
+terminates automatically if you materially violate this Agreement.
+Upon termination, you must stop using and uninstall the Software.
+Sections that by their nature should survive termination, including
+ownership, disclaimers, limitations of liability, and general terms,
+will survive.
+
+12. General Terms
+
+This Agreement is the entire agreement between you and Publisher about
+the Software and supersedes prior statements about its license. If any
+provision is unenforceable, it will be enforced to the maximum extent
+permitted and the remaining provisions will remain effective. Failure
+to enforce a provision is not a waiver. You may not assign this
+Agreement without Publisher's written consent. This Agreement does not
+limit rights that cannot be waived under applicable consumer law.
+
+13. Contact
+
+Marco Macias
+WakeMATE
+https://wakematemobile.com

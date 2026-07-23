@@ -7,7 +7,7 @@ This folder contains an Inno Setup template for packaging WakeMATE Companion as 
 - Produce a signed `target\release\wakemate-companion.exe`
 - Place the official Microsoft Visual C++ x64 redistributable at `installer\redist\VC_redist.x64.exe`
 - Replace placeholders in `wakemate-companion.iss`
-- Replace `..\docs\EULA_TEMPLATE.txt` with your final EULA text
+- Review `..\docs\EULA.txt` with qualified counsel for the intended release jurisdictions
 - Review `INSTALL_WARNING.txt`
 - Finalize `..\docs\THIRD_PARTY_NOTICES_TEMPLATE.md`
 

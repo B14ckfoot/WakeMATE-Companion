@@ -171,4 +171,5 @@ Push a `v*` tag → [.github/workflows/release.yml](./.github/workflows/release.
 - [docs/WINDOWS_BUILD.md](./docs/WINDOWS_BUILD.md) — Windows toolchain notes
 - [docs/TROUBLESHOOTING.md](./docs/TROUBLESHOOTING.md) — common issues
 - [docs/RELEASE_CHECKLIST.md](./docs/RELEASE_CHECKLIST.md) — pre-ship checklist
-- [docs/PRIVACY_TEMPLATE.md](./docs/PRIVACY_TEMPLATE.md), [docs/EULA_TEMPLATE.txt](./docs/EULA_TEMPLATE.txt), [docs/THIRD_PARTY_NOTICES_TEMPLATE.md](./docs/THIRD_PARTY_NOTICES_TEMPLATE.md) — legal templates (placeholders)
+- [docs/EULA.txt](./docs/EULA.txt) — installer-visible end-user license agreement
+- [docs/PRIVACY_TEMPLATE.md](./docs/PRIVACY_TEMPLATE.md), [docs/THIRD_PARTY_NOTICES_TEMPLATE.md](./docs/THIRD_PARTY_NOTICES_TEMPLATE.md) — legal templates that still contain placeholders

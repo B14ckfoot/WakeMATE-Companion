@@ -8,7 +8,8 @@ This checklist is for shipping a public Windows download. It is not legal advice
 - Choose the final product version.
 - Choose a support email and website URL.
 - Choose a software license for this repo.
-- Replace all placeholder text in the privacy policy, EULA, and installer files.
+- Have qualified counsel review `docs/EULA.txt` for the intended release jurisdictions.
+- Replace all placeholder text in the privacy policy, third-party notices, and installer files.
 
 ## Security Gates
 
@@ -61,7 +62,7 @@ This checklist is for shipping a public Windows download. It is not legal advice
 ## Legal And Policy Gates
 
 - Publish a privacy policy if you collect or transmit personal data, diagnostics, account details, or identifiers beyond local device control.
-- Publish an EULA or Terms document if you want installer-visible usage terms or warranty/liability language.
+- Confirm the installer displays the approved `docs/EULA.txt` and requires acceptance before installation.
 - Clearly disclose that enabling remote access allows network control of mouse, keyboard, media, and power actions.
 - Clearly disclose that the pairing token must be kept secret.
 - Review third-party crate licenses and ship required notices.
@@ -71,7 +72,7 @@ This checklist is for shipping a public Windows download. It is not legal advice
 
 - `README.md`
 - `docs/PRIVACY_TEMPLATE.md`
-- `docs/EULA_TEMPLATE.txt`
+- `docs/EULA.txt`
 - `docs/THIRD_PARTY_NOTICES_TEMPLATE.md`
 - `installer/INSTALL_WARNING.txt`
 - `installer/wakemate-companion.iss`
@@ -80,4 +81,5 @@ This checklist is for shipping a public Windows download. It is not legal advice
 
 - No final software license has been chosen yet.
 - No production signing certificate is configured yet.
-- Privacy policy, EULA, publisher identity, and support contact details are still placeholders.
+- Privacy policy, third-party notices, and some support/release details still contain placeholders.
+- The EULA text exists but still requires qualified legal review before a public release.

@@ -1,7 +1,7 @@
 #define MyAppName "WakeMATE Companion"
 #define MyAppVersion "0.1.0"
-#define MyAppPublisher "REPLACE_WITH_PUBLISHER"
-#define MyAppURL "https://example.com"
+#define MyAppPublisher "Marco Macias"
+#define MyAppURL "https://wakematemobile.com"
 #define MyAppExeName "wakemate-companion.exe"
 #define MyAppId "{{8C9F7D9E-0D7D-4F64-9B09-4E6050A531F0}}"
 #define MyVCRedistExe "VC_redist.x64.exe"
@@ -26,6 +26,9 @@ PrivilegesRequired=admin
 ChangesAssociations=no
 UninstallDisplayIcon={app}\app-icon.ico
 SetupIconFile=..\assets\app-icon.ico
+WizardImageFile=branding\wizard-image.png,branding\wizard-image-2x.png
+WizardSmallImageFile=branding\wizard-image-small.png,branding\wizard-image-small-2x.png
+WizardImageStretch=no
 LicenseFile=..\docs\EULA_TEMPLATE.txt
 InfoBeforeFile=INSTALL_WARNING.txt
 OutputDir=..\dist\installer
@@ -56,6 +59,13 @@ Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""WakeMATE Companion Se
 Filename: "{sys}\reg.exe"; Parameters: "delete ""HKCU\Software\Microsoft\Windows\CurrentVersion\Run"" /v ""WakeMATE Companion"" /f"; Flags: runhidden skipifdoesntexist; RunOnceId: "RemoveStartupRegistration"
 
 [Code]
+procedure InitializeWizard;
+begin
+  { WakeMATE brand cyan (src/theme.rs PRIMARY, #0891B2), in Delphi's $00BBGGRR order. }
+  WizardForm.PageNameLabel.Font.Color := $00B29108;
+  WizardForm.PageNameLabel.Font.Style := [fsBold];
+end;
+
 function IsVCRedistInstalled: Boolean;
 var
   Installed: Cardinal;

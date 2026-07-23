@@ -29,7 +29,7 @@ No terminal, runtime installation, config editing, or manual port setup is requi
 
 1. Make sure the phone and this PC are on the same Wi-Fi/LAN.
 2. Click the WakeMATE tray icon → **View Pairing QR Code**.
-3. In the WakeMATE mobile app, scan the QR code — either from **Add device → Scan QR** (saves the computer *and* pairs in one scan) or from **Settings** via the camera button next to the pairing-token field. The QR carries the device name, address, and pairing token (pairing contract v2).
+3. In the WakeMATE mobile app, scan the QR code — either from **Add device → Scan QR** (saves the computer *and* pairs in one scan) or from **Settings** via the camera button next to the pairing-token field. The QR carries the device name, address, pairing token, HTTPS port, and certificate fingerprint (pairing contract v2). The phone pins that fingerprint before sending the token.
 4. The mobile app saves the token and requests activation. A dialog appears **on this desktop**: *"A device at `<ip>` wants to pair…"*. Click **Yes** only if you just initiated pairing from your own phone. The phone polls the companion and shows the real outcome (approved, denied, or still waiting).
 5. Remote mouse/keyboard/media/power controls are now enabled for the paired phone.
 
@@ -57,7 +57,7 @@ There is **no automatic update yet**. To update, download the newer installer an
 
 ### Uninstalling
 
-Use Windows **Settings → Apps → WakeMATE Companion → Uninstall**. This removes the app, the boot-time service, and the startup registration. Your config folder (`%APPDATA%\WakeMATE Companion`) and the pairing token stored in Windows Credential Manager are currently left behind; use tray → **Reset Companion…** *before* uninstalling if you want all local state wiped.
+Use Windows **Settings → Apps → WakeMATE Companion → Uninstall**. This removes the app, the boot-time service, and the startup registration. Your config folder (`%APPDATA%\WakeMATE Companion`), TLS identity, and pairing token stored in Windows Credential Manager are currently left behind; use tray → **Reset Companion…** *before* uninstalling to clear pairing settings, then remove the app-data folder if you also want the retained TLS identity deleted.
 
 ### Troubleshooting
 
@@ -68,7 +68,9 @@ See [docs/TROUBLESHOOTING.md](./docs/TROUBLESHOOTING.md). Quick checks: both dev
 ## Security & Privacy
 
 - Everything is local — WakeMATE has **no cloud account, no telemetry**; the phone talks directly to this PC over your LAN.
-- HTTP binds to `127.0.0.1` unless LAN access is explicitly enabled; UDP discovery additionally requires its own flag.
+- HTTPS binds to `127.0.0.1` unless LAN access is explicitly enabled; UDP discovery additionally requires its own flag.
+- The companion generates a persistent self-signed certificate and the mobile app pins its SHA-256 fingerprint from the visual pairing QR. Public certificate authorities and DHCP-stable hostnames are not required.
+- A plaintext HTTP listener remains enabled by default for one migration release so older phones keep working. Current QR-paired builds use pinned HTTPS; set `allow_insecure_http` to `false` after every phone has been upgraded and re-scanned.
 - Input and power commands are off by default and require both a config flag **and** the one-time desktop approval dialog.
 - The pairing token lives in the **Windows Credential Manager**, not in a plaintext file (older plaintext tokens are migrated automatically; the config file's `api_token` field then reads as empty — this is intentional).
 - Token comparison is constant-time; repeated bad tokens trigger a per-IP lockout; a single-instance lock prevents duplicate copies.
@@ -79,7 +81,7 @@ See [docs/TROUBLESHOOTING.md](./docs/TROUBLESHOOTING.md). Quick checks: both dev
 
 Confirmed in the 2026-07-23 audit (items struck through were fixed the same day in protocol v2):
 
-- **No transport encryption yet** — traffic is plaintext HTTP on your LAN. The planned fix (self-signed TLS with fingerprint pinning via the QR code) requires a coordinated mobile-app change.
+- ~~No transport encryption~~ — fixed for current mobile builds with self-signed TLS and QR fingerprint pinning. The old HTTP listener is still available behind `allow_insecure_http` during the migration window.
 - **One shared token** — rotating it un-pairs every phone; per-device revocation is planned.
 - ~~Mouse drag/hold from the phone does not work~~ — fixed: the companion now implements the `mouse_button` down/up command.
 - ~~The mobile "Add device → Scan QR" screen can't read the companion's QR~~ — fixed: the QR now carries a JSON payload (name, IP, port, MAC, token) both mobile scanners understand.
@@ -98,14 +100,14 @@ Everything below is for building from source; end users never need it.
 WakeMATE has two behaviors:
 
 1. **Offline wake path** — send a Wake-on-LAN magic packet to a saved MAC address; works while the target PC sleeps (handled by the network adapter, not the app).
-2. **Online control path** — once awake and paired, the companion accepts authenticated HTTP commands for status, wake relay, input, media, and power. On Windows, a headless boot task (`schtasks /RU SYSTEM`, required by Task Scheduler for pre-logon triggers) answers `/v1/health` and `/v1/info` before sign-in, while the tray app starts at logon.
+2. **Online control path** — once awake and paired, the companion accepts authenticated pinned-HTTPS commands for status, wake relay, input, media, and power. On Windows, a headless boot task (`schtasks /RU SYSTEM`, required by Task Scheduler for pre-logon triggers) answers `/v1/health` and `/v1/info` before sign-in, while the tray app starts at logon. Plain HTTP is a temporary compatibility listener controlled by `allow_insecure_http`.
 
 ### API summary
 
 Public: `GET /`, `GET /v1/health` (includes `protocol_version`, currently `2`).
 Authenticated (`x-wakemate-token` header; per-IP rate-limited): `GET /v1/info`, `GET /v1/pairing/check`, `GET /v1/pairing/status` (returns `approval: idle|pending|approved|denied` plus the capability flags, so the phone can poll for the desktop's Yes/No), `POST /v1/pairing/activate` (returns `pending_approval`; grant happens only via the desktop dialog), `POST /v1/wake`, `POST /v1/command`.
-Discovery: UDP port `41234`, probe string `wakemate:discover`, JSON reply with device name, IP, MAC, API port, version, and `protocol_version`; only active when remote access **and** discovery are both enabled.
-Pairing QR (contract v2): JSON `{"v":2,"kind":"wakemate-pairing","name":...,"ip":...,"api_port":...,"mac":...,"token":...,"protocol_version":2}`; `ip`/`mac` are omitted when the network can't be detected.
+Discovery: UDP port `41234`, probe string `wakemate:discover`, JSON reply with device name, IP, MAC, legacy API port, TLS port, TLS fingerprint, version, and `protocol_version`; only active when remote access **and** discovery are both enabled. Discovery metadata is informational; the phone only trusts a fingerprint obtained through the visual QR channel.
+Pairing QR (contract v2): JSON `{"v":2,"kind":"wakemate-pairing","name":...,"ip":...,"api_port":...,"tls_port":...,"fp":...,"mac":...,"token":...,"protocol_version":2}`; `ip`/`mac` are omitted when the network can't be detected. `fp` is the lowercase SHA-256 digest of the leaf certificate's DER bytes.
 
 Command payload examples (all `POST /v1/command`, snake_case tagged):
 
@@ -129,7 +131,9 @@ First run creates `wakemate.config.json` under:
 - macOS: `~/Library/Application Support/WakeMATE Companion/`
 - Linux: `$XDG_CONFIG_HOME/WakeMATE Companion/` or `~/.config/WakeMATE Companion/`
 
-Fields: `bind_address`, `discovery_port`, `discovery_message`, `api_token` / `token_storage` (empty + `"keyring"` once migrated to the OS credential store), `device_name`, `launch_on_startup`, `allow_input_commands`, `allow_power_commands`, `allow_remote_connections` (when `false`, HTTP is forced to `127.0.0.1`), `allow_discovery`, `require_auth_for_info`. Sample: [wakemate.config.example.json](./wakemate.config.example.json). The only supported environment variable is `RUST_LOG` (see [.env.example](./.env.example)).
+Fields: `bind_address` (legacy HTTP address and host used for HTTPS), `tls_port`, `allow_insecure_http`, `discovery_port`, `discovery_message`, `api_token` / `token_storage` (empty + `"keyring"` once migrated to the OS credential store), `device_name`, `launch_on_startup`, `allow_input_commands`, `allow_power_commands`, `allow_remote_connections` (when `false`, both listeners are forced to `127.0.0.1`), `allow_discovery`, `require_auth_for_info`. Sample: [wakemate.config.example.json](./wakemate.config.example.json). The only supported environment variable is `RUST_LOG` (see [.env.example](./.env.example)).
+
+The persistent certificate and private key are stored together as `wakemate.tls.json` in the same app-data folder. A corrupt identity is treated as an error instead of silently generating a new certificate and breaking existing pins.
 
 `GET /v1/info` (authenticated) additionally returns Wake-on-LAN fields the mobile app should save while the PC is online: `mac_address`, `broadcast_address`, `wol_port`, plus `interface_name`, `subnet_mask`, `ping_address`. When the PC later sleeps, the phone sends the magic packet directly using those saved values.
 

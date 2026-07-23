@@ -83,6 +83,11 @@ pub struct DiscoveryResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mac_address: Option<String>,
     pub api_port: u16,
+    pub tls_port: u16,
+    /// Lowercase SHA-256 digest of the leaf certificate's DER bytes. The
+    /// mobile app only trusts this value after the same digest arrives over
+    /// the visual QR pairing channel.
+    pub fp: String,
     pub version: String,
     pub protocol_version: u32,
 }

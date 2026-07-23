@@ -23,10 +23,13 @@ This checklist is for shipping a public Windows download. It is not legal advice
 - Confirm the tray `Rotate Pairing Token` action works and persists the new token.
 - Confirm `/v1/pairing/activate` does **not** grant input/power capability without an explicit "Yes" on the native desktop confirmation dialog, and that it is refused outright from the pre-logon headless service.
 - Confirm repeated bad tokens against an authenticated endpoint trigger the per-IP lockout (429) within a few dozen requests.
+- Confirm the pairing QR carries `tls_port` and the exact lowercase SHA-256 leaf-certificate fingerprint, and that the fingerprint remains stable across companion restarts.
+- Confirm the current Android and iOS mobile builds reject a changed/mismatched certificate before sending the token.
+- Confirm every supported phone has upgraded and re-scanned before setting `allow_insecure_http` to `false`; do not ship a wider-than-home-LAN release with the compatibility listener enabled.
 - Confirm "Reset Companion..." clears the stored token and local settings after its own confirmation dialog, and does not claim to affect any cloud account (it can't -- there isn't one).
 - Test on a trusted LAN and on an untrusted network profile.
 - If remote access is enabled, make sure Windows Firewall prompts are understood and documented.
-- Re-read `docs/SECURITY_MODEL.md`'s "Known limitation: no transport encryption" section -- this has **not** been fixed and is the top item to resolve before any wider-than-home-LAN release.
+- Re-read `docs/SECURITY_MODEL.md`'s "Transitional HTTP compatibility" section and verify the migration listener is disabled for any wider-than-home-LAN release.
 
 ## Packaging Gates
 

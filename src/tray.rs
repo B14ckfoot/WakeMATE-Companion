@@ -33,6 +33,7 @@ use crate::{
     config::{AppConfig, SharedConfig},
     pairing::{PairingCoordinator, PairingRequestInfo},
     run_server, system, theme,
+    tls::TlsIdentity,
 };
 
 const POPUP_LOGICAL_WIDTH: f64 = 280.0;
@@ -82,9 +83,12 @@ struct TrayApp {
 impl TrayApp {
     fn new(config: SharedConfig, assets_dir: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         let snapshot = config_snapshot(&config)?;
-        let server = if system::server_is_reachable(&snapshot.effective_bind_address()) {
+        let existing_listener = system::server_is_reachable(&snapshot.effective_bind_address())
+            || system::server_is_reachable(&snapshot.effective_tls_bind_address());
+        let server = if existing_listener {
             info!(
-                bind = %snapshot.effective_bind_address(),
+                http_bind = %snapshot.effective_bind_address(),
+                tls_bind = %snapshot.effective_tls_bind_address(),
                 "WakeMATE detected an existing server listener and will reuse it"
             );
             ServerThread::inactive()
@@ -596,10 +600,13 @@ impl PairingPopup {
         window.focus_window();
         window.request_redraw();
 
+        let tls_identity = TlsIdentity::load_or_create()?;
         let qr_payload = pairing_qr_payload(
             &snapshot.api_token,
             &snapshot.device_name,
             snapshot.bind_port(),
+            snapshot.tls_port,
+            tls_identity.fingerprint(),
         );
 
         Ok(Self {
@@ -1353,7 +1360,13 @@ fn config_snapshot(config: &SharedConfig) -> Result<AppConfig, Box<dyn std::erro
 /// v2): everything the phone needs to save this computer and pair in one
 /// scan. Older mobile builds that JSON-parse the code and look for a `token`
 /// key keep working; the bare-token v1 format is superseded by this.
-fn pairing_qr_payload(token: &str, device_name: &str, api_port: u16) -> String {
+fn pairing_qr_payload(
+    token: &str,
+    device_name: &str,
+    api_port: u16,
+    tls_port: u16,
+    tls_fingerprint: &str,
+) -> String {
     let network = system::primary_network_info();
     let ip = network
         .as_ref()
@@ -1361,13 +1374,23 @@ fn pairing_qr_payload(token: &str, device_name: &str, api_port: u16) -> String {
         .or_else(system::local_ipv4);
     let mac = network.as_ref().and_then(|info| info.mac_address.clone());
 
-    pairing_qr_payload_from_parts(token, device_name, api_port, ip, mac)
+    pairing_qr_payload_from_parts(
+        token,
+        device_name,
+        api_port,
+        tls_port,
+        tls_fingerprint,
+        ip,
+        mac,
+    )
 }
 
 fn pairing_qr_payload_from_parts(
     token: &str,
     device_name: &str,
     api_port: u16,
+    tls_port: u16,
+    tls_fingerprint: &str,
     ip: Option<String>,
     mac: Option<String>,
 ) -> String {
@@ -1376,6 +1399,8 @@ fn pairing_qr_payload_from_parts(
         "kind": "wakemate-pairing",
         "name": device_name,
         "api_port": api_port,
+        "tls_port": tls_port,
+        "fp": tls_fingerprint,
         "token": token,
         "protocol_version": crate::types::PROTOCOL_VERSION,
     });
@@ -1427,6 +1452,8 @@ fn windows_pairing_notifier(
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ServerRuntimeConfig {
     bind_address: String,
+    tls_bind_address: String,
+    allow_insecure_http: bool,
     discovery_port: u16,
     discovery_enabled: bool,
 }
@@ -1435,6 +1462,8 @@ impl From<&AppConfig> for ServerRuntimeConfig {
     fn from(config: &AppConfig) -> Self {
         Self {
             bind_address: config.effective_bind_address(),
+            tls_bind_address: config.effective_tls_bind_address(),
+            allow_insecure_http: config.allow_insecure_http,
             discovery_port: config.discovery_port,
             discovery_enabled: config.discovery_enabled(),
         }
@@ -1519,6 +1548,9 @@ mod tests {
         keyboard::{Key, KeyCode, NamedKey, PhysicalKey},
     };
 
+    const TEST_TLS_FINGERPRINT: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
     #[test]
     fn popup_prefers_space_above_the_tray() {
         let position = position_popup(
@@ -1572,6 +1604,8 @@ mod tests {
             "token-value",
             "Desk Rig",
             7777,
+            7778,
+            TEST_TLS_FINGERPRINT,
             Some("192.168.1.50".to_string()),
             Some("00:11:22:33:44:55".to_string()),
         );
@@ -1581,6 +1615,8 @@ mod tests {
         assert_eq!(parsed["kind"], "wakemate-pairing");
         assert_eq!(parsed["name"], "Desk Rig");
         assert_eq!(parsed["api_port"], 7777);
+        assert_eq!(parsed["tls_port"], 7778);
+        assert_eq!(parsed["fp"], TEST_TLS_FINGERPRINT);
         assert_eq!(parsed["token"], "token-value");
         assert_eq!(parsed["ip"], "192.168.1.50");
         assert_eq!(parsed["mac"], "00:11:22:33:44:55");
@@ -1588,7 +1624,15 @@ mod tests {
 
     #[test]
     fn pairing_qr_payload_omits_unknown_network_fields() {
-        let payload = pairing_qr_payload_from_parts("token-value", "Desk Rig", 7777, None, None);
+        let payload = pairing_qr_payload_from_parts(
+            "token-value",
+            "Desk Rig",
+            7777,
+            7778,
+            TEST_TLS_FINGERPRINT,
+            None,
+            None,
+        );
         let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
 
         assert!(parsed.get("ip").is_none());
@@ -1602,6 +1646,8 @@ mod tests {
             "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
             "Desk Rig",
             7777,
+            7778,
+            TEST_TLS_FINGERPRINT,
             Some("192.168.1.50".to_string()),
             Some("00:11:22:33:44:55".to_string()),
         );

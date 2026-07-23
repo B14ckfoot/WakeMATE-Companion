@@ -10,6 +10,7 @@ mod pairing;
 mod security;
 mod system;
 mod theme;
+mod tls;
 #[cfg(target_os = "windows")]
 mod tray;
 mod types;
@@ -23,6 +24,7 @@ use std::{
 use tokio::net::TcpListener;
 #[cfg(not(target_os = "windows"))]
 use tokio::signal;
+use tokio::sync::watch;
 #[cfg(not(target_os = "windows"))]
 use tracing::error;
 use tracing::{info, warn};
@@ -32,6 +34,7 @@ use crate::{
     app::{router, AppState},
     config::{AppConfig, SharedConfig},
     pairing::PairingCoordinator,
+    tls::TlsIdentity,
 };
 
 const PREPARE_INSTALL_CONFIG_ARG: &str = "--prepare-install-config";
@@ -40,6 +43,7 @@ const CONFIG_PATH_ARG: &str = "--config-path";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
+    tls::install_crypto_provider();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let config_path = config_path_from_args(&args)?.unwrap_or(AppConfig::path()?);
@@ -154,30 +158,83 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let snapshot = config_snapshot(&config)?;
-    let bind_address = snapshot.effective_bind_address();
-    let listener = TcpListener::bind(&bind_address).await?;
-    info!(bind = %bind_address, headless, "WakeMATE HTTP listener ready");
+    let tls_identity = TlsIdentity::load_or_create()?;
+    let tls_fingerprint = tls_identity.fingerprint().to_string();
+    let tls_bind_address = snapshot.effective_tls_bind_address();
+    let tls_socket_address: SocketAddr = tls_bind_address.parse()?;
+    let rustls_config = tls_identity.rustls_config().await?;
+    let http_listener = if snapshot.allow_insecure_http {
+        let bind_address = snapshot.effective_bind_address();
+        let listener = TcpListener::bind(&bind_address).await?;
+        info!(
+            bind = %bind_address,
+            headless,
+            "WakeMATE transitional HTTP listener ready"
+        );
+        Some(listener)
+    } else {
+        info!("WakeMATE insecure HTTP compatibility listener disabled");
+        None
+    };
+    info!(
+        bind = %tls_bind_address,
+        headless,
+        "WakeMATE pinned HTTPS listener ready"
+    );
 
     let discovery_task = if snapshot.discovery_enabled() {
-        Some(tokio::spawn(discovery::run(config.clone())))
+        Some(tokio::spawn(discovery::run(
+            config.clone(),
+            tls_fingerprint,
+        )))
     } else {
         info!("WakeMATE UDP discovery disabled until remote access is enabled");
         None
     };
 
     let state = AppState::new(config, pairing, headless);
-    axum::serve(
-        listener,
-        router(state).into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown)
-    .await?;
+    let tls_handle = axum_server::Handle::new();
+    let shutdown_tls_handle = tls_handle.clone();
+    let (http_shutdown_tx, http_shutdown_rx) = watch::channel(false);
+    let shutdown_task = tokio::spawn(async move {
+        shutdown.await;
+        shutdown_tls_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+        let _ = http_shutdown_tx.send(true);
+    });
+
+    let tls_server = axum_server::bind_rustls(tls_socket_address, rustls_config)
+        .handle(tls_handle)
+        .serve(router(state.clone()).into_make_service_with_connect_info::<SocketAddr>());
+
+    if let Some(listener) = http_listener {
+        let http_server = axum::serve(
+            listener,
+            router(state).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(wait_for_shutdown(http_shutdown_rx));
+
+        tokio::select! {
+            result = tls_server => result?,
+            result = http_server => result?,
+        }
+    } else {
+        tls_server.await?;
+    }
 
     if let Some(discovery_task) = discovery_task {
         discovery_task.abort();
         let _ = discovery_task.await;
     }
+    shutdown_task.abort();
+    let _ = shutdown_task.await;
     Ok(())
+}
+
+async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    let _ = shutdown.changed().await;
 }
 
 #[cfg(not(target_os = "windows"))]

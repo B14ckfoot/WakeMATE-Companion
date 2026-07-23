@@ -19,29 +19,88 @@ function Get-VsWherePath {
     return $null
 }
 
-function Get-VsInstallPath {
-    $vswhere = Get-VsWherePath
-    if ($vswhere) {
-        $installationPath = & $vswhere -latest -products * -property installationPath
-        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($installationPath)) {
-            return $installationPath.Trim()
+function Get-MsvcToolsPathForInstall {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$VsInstallPath
+    )
+
+    $toolsRoot = Join-Path $VsInstallPath 'VC\Tools\MSVC'
+    if (-not (Test-Path -LiteralPath $toolsRoot)) {
+        return $null
+    }
+
+    $latestToolsDir = Get-ChildItem -LiteralPath $toolsRoot -Directory |
+        Sort-Object Name -Descending |
+        Select-Object -First 1
+
+    if (-not $latestToolsDir) {
+        return $null
+    }
+
+    return $latestToolsDir.FullName
+}
+
+function Test-VsInstallHasCompleteMsvc {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$VsInstallPath
+    )
+
+    $toolsPath = Get-MsvcToolsPathForInstall -VsInstallPath $VsInstallPath
+    if (-not $toolsPath) {
+        return $false
+    }
+
+    $requiredPaths = @(
+        (Join-Path $toolsPath 'bin\HostX64\x64\cl.exe'),
+        (Join-Path $toolsPath 'include\vcruntime.h')
+    )
+
+    foreach ($path in $requiredPaths) {
+        if (-not (Test-Path -LiteralPath $path)) {
+            return $false
         }
     }
 
-    $commonPaths = @(
+    return (
+        (Test-Path -LiteralPath (Join-Path $toolsPath 'lib\x64\msvcrt.lib')) -or
+        (Test-Path -LiteralPath (Join-Path $toolsPath 'lib\onecore\x64\msvcrt.lib'))
+    )
+}
+
+function Get-VsInstallPath {
+    $vswhere = Get-VsWherePath
+    $candidates = @()
+    if ($vswhere) {
+        $installationPaths = & $vswhere -all -products * -property installationPath
+        if ($LASTEXITCODE -eq 0) {
+            $candidates += $installationPaths |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                ForEach-Object { $_.Trim() }
+        }
+    }
+
+    $candidates += @(
         'C:\Program Files\Microsoft Visual Studio\18\Community',
+        'C:\Program Files\Microsoft Visual Studio\2022\Community',
         'C:\Program Files\Microsoft Visual Studio\17\Community',
         'C:\Program Files\Microsoft Visual Studio\18\BuildTools',
+        'C:\Program Files\Microsoft Visual Studio\2022\BuildTools',
         'C:\Program Files\Microsoft Visual Studio\17\BuildTools'
     )
 
-    foreach ($path in $commonPaths) {
-        if (Test-Path -LiteralPath $path) {
+    foreach ($path in ($candidates | Select-Object -Unique)) {
+        if ((Test-Path -LiteralPath $path) -and (Test-VsInstallHasCompleteMsvc -VsInstallPath $path)) {
             return $path
+        }
+
+        if (Test-Path -LiteralPath $path) {
+            Write-Warning "Skipping incomplete MSVC installation: $path"
         }
     }
 
-    throw 'Visual Studio was not found. Install Visual Studio or Build Tools with the MSVC x64 toolchain.'
+    throw 'No complete Visual Studio C++ installation was found. Install or repair the MSVC x64 compiler, headers, and libraries.'
 }
 
 function Get-VsDevCmdPath {
@@ -100,16 +159,12 @@ function Get-MsvcToolsPath {
         return $env:VCToolsInstallDir.TrimEnd('\')
     }
 
-    $toolsRoot = Join-Path $VsInstallPath 'VC\Tools\MSVC'
-    $latestToolsDir = Get-ChildItem -LiteralPath $toolsRoot -Directory |
-        Sort-Object Name -Descending |
-        Select-Object -First 1
-
-    if (-not $latestToolsDir) {
-        throw "No MSVC tools directory was found under '$toolsRoot'."
+    $toolsPath = Get-MsvcToolsPathForInstall -VsInstallPath $VsInstallPath
+    if (-not $toolsPath) {
+        throw "No MSVC tools directory was found under '$VsInstallPath\VC\Tools\MSVC'."
     }
 
-    return $latestToolsDir.FullName
+    return $toolsPath
 }
 
 function Test-LibraryOnLibPath {
@@ -208,6 +263,13 @@ try {
     $vsDevCmdPath = Get-VsDevCmdPath -VsInstallPath $vsInstallPath
 
     Write-Host 'Using Visual Studio:' $vsInstallPath
+    $vswherePath = Get-VsWherePath
+    if ($vswherePath) {
+        $vswhereDir = Split-Path -Parent $vswherePath
+        if (($env:PATH -split ';') -notcontains $vswhereDir) {
+            $env:PATH = $vswhereDir + ';' + $env:PATH
+        }
+    }
     Import-BatchEnvironment -BatchPath $vsDevCmdPath -Arguments '-arch=x64'
 
     $msvcToolsPath = Get-MsvcToolsPath -VsInstallPath $vsInstallPath

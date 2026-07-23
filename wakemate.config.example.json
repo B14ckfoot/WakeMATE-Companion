@@ -1,5 +1,7 @@
 {
   "bind_address": "0.0.0.0:7777",
+  "tls_port": 7778,
+  "allow_insecure_http": true,
   "discovery_port": 41234,
   "discovery_message": "wakemate:discover",
   "api_token": "replace-this-with-a-secret-token",

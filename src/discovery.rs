@@ -7,7 +7,7 @@ use crate::{
     types::{DiscoveryResponse, PROTOCOL_VERSION},
 };
 
-pub async fn run(config: SharedConfig) {
+pub async fn run(config: SharedConfig, tls_fingerprint: String) {
     let initial = match config.lock() {
         Ok(guard) => guard.clone(),
         Err(_) => {
@@ -62,6 +62,8 @@ pub async fn run(config: SharedConfig) {
                 .unwrap_or_else(|| system::local_ipv4().unwrap_or_else(|| "127.0.0.1".to_string())),
             mac_address: network.as_ref().and_then(|info| info.mac_address.clone()),
             api_port,
+            tls_port: snapshot.tls_port,
+            fp: tls_fingerprint.clone(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             protocol_version: PROTOCOL_VERSION,
         };

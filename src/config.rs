@@ -17,6 +17,7 @@ pub type SharedConfig = Arc<Mutex<AppConfig>>;
 
 const APP_DIR_NAME: &str = "WakeMATE Companion";
 const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0:7777";
+const DEFAULT_TLS_PORT: u16 = 7778;
 const DEFAULT_DISCOVERY_MESSAGE: &str = "wakemate:discover";
 
 /// Records where the pairing token currently lives so the UI can be honest
@@ -37,6 +38,12 @@ pub enum TokenStorage {
 #[serde(default)]
 pub struct AppConfig {
     pub bind_address: String,
+    /// HTTPS always listens on this port. `bind_address` keeps its original
+    /// HTTP port for the one-release migration window.
+    pub tls_port: u16,
+    /// Transitional compatibility switch. Set false after all paired phones
+    /// have scanned a TLS-capable QR code.
+    pub allow_insecure_http: bool,
     pub discovery_port: u16,
     pub discovery_message: String,
     /// In-memory pairing token. When `token_storage` is `Keyring` this is
@@ -252,6 +259,15 @@ impl AppConfig {
         }
     }
 
+    pub fn effective_tls_bind_address(&self) -> String {
+        let http_address = self.effective_bind_address();
+        let host = http_address
+            .rsplit_once(':')
+            .map(|(host, _)| host)
+            .unwrap_or(http_address.as_str());
+        format!("{host}:{}", self.tls_port)
+    }
+
     pub fn discovery_enabled(&self) -> bool {
         self.allow_remote_connections && self.allow_discovery
     }
@@ -286,6 +302,10 @@ impl AppConfig {
             self.discovery_message = DEFAULT_DISCOVERY_MESSAGE.to_string();
         }
 
+        if self.tls_port == 0 {
+            self.tls_port = DEFAULT_TLS_PORT;
+        }
+
         if self.device_name.trim().is_empty() {
             self.device_name = detect_device_name();
         }
@@ -296,6 +316,8 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             bind_address: DEFAULT_BIND_ADDRESS.to_string(),
+            tls_port: DEFAULT_TLS_PORT,
+            allow_insecure_http: true,
             discovery_port: 41234,
             discovery_message: DEFAULT_DISCOVERY_MESSAGE.to_string(),
             api_token: String::new(),

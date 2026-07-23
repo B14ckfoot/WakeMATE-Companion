@@ -11,12 +11,12 @@ use crate::{
     config::{AppConfig, SharedConfig},
     error::AppError,
     input::InputController,
-    pairing::{PairingCoordinator, PairingOutcome, PairingRequestInfo},
+    pairing::{ApprovalState, PairingCoordinator, PairingOutcome, PairingRequestInfo},
     security::{tokens_match, RateLimiter},
     system,
     types::{
         ApiResponse, CommandRequest, HealthResponse, InfoResponse, PairingActivationResponse,
-        WakeRequest, AUTH_HEADER,
+        PairingStatusResponse, WakeRequest, AUTH_HEADER, PROTOCOL_VERSION,
     },
 };
 
@@ -48,6 +48,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/health", get(health))
         .route("/v1/info", get(info))
         .route("/v1/pairing/check", get(pairing_check))
+        .route("/v1/pairing/status", get(pairing_status))
         .route("/v1/pairing/activate", post(pairing_activate))
         .route("/v1/wake", post(wake))
         .route("/v1/command", post(command))
@@ -68,6 +69,7 @@ async fn health(State(state): State<AppState>) -> Json<ApiResponse<HealthRespons
             status: "online",
             device_name: config.device_name,
             version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: PROTOCOL_VERSION,
         },
     ))
 }
@@ -119,6 +121,34 @@ async fn pairing_check(
     let config = config_snapshot(&state.config)?;
     authenticate(&state, peer, &headers, &config.api_token)?;
     Ok(Json(ApiResponse::message("pairing token accepted")))
+}
+
+async fn pairing_status(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<ApiResponse<PairingStatusResponse>>, AppError> {
+    let config = config_snapshot(&state.config)?;
+    authenticate(&state, peer, &headers, &config.api_token)?;
+
+    // If capabilities are already granted (an earlier approval, possibly in a
+    // previous run), report "approved" even though no prompt happened this
+    // session -- the phone cares about the effective outcome.
+    let approval = match state.pairing.approval_state() {
+        ApprovalState::Idle if config.allow_input_commands || config.allow_power_commands => {
+            ApprovalState::Approved
+        }
+        state => state,
+    };
+
+    Ok(Json(ApiResponse::ok(
+        "pairing status",
+        PairingStatusResponse {
+            approval: approval.as_str(),
+            allow_input_commands: config.allow_input_commands,
+            allow_power_commands: config.allow_power_commands,
+        },
+    )))
 }
 
 async fn pairing_activate(
@@ -216,6 +246,14 @@ async fn command(
             } else {
                 "mouse click sent".to_string()
             }
+        }
+        CommandRequest::MouseButton { button, action } => {
+            ensure_input_enabled(&state, &config)?;
+            let button = button.unwrap_or(crate::types::MouseButtonArg::Left);
+            input
+                .mouse_button(button, action)
+                .map_err(AppError::internal)?;
+            "mouse button state sent".to_string()
         }
         CommandRequest::MouseScroll { direction, amount } => {
             ensure_input_enabled(&state, &config)?;

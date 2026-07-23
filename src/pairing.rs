@@ -30,7 +30,63 @@ pub enum PairingOutcome {
     Unavailable,
 }
 
-type Notifier = dyn Fn(PairingRequestInfo, SharedConfig) + Send + Sync;
+/// Where the most recent pairing-activation prompt stands, so the phone can
+/// poll `/v1/pairing/status` and show a truthful pending/approved/denied
+/// state instead of assuming success. A denial is per-prompt, not permanent:
+/// the next activation request shows a fresh prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApprovalState {
+    #[default]
+    Idle,
+    Pending,
+    Approved,
+    Denied,
+}
+
+impl ApprovalState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApprovalState::Idle => "idle",
+            ApprovalState::Pending => "pending",
+            ApprovalState::Approved => "approved",
+            ApprovalState::Denied => "denied",
+        }
+    }
+}
+
+/// Shared between the coordinator (which marks a prompt as pending), the
+/// platform notifier (which records the human's Yes/No), and the HTTP status
+/// endpoint (which reports it).
+#[derive(Default)]
+pub struct PairingStatusHandle {
+    state: Mutex<ApprovalState>,
+}
+
+impl PairingStatusHandle {
+    pub fn get(&self) -> ApprovalState {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    pub fn set(&self, state: ApprovalState) {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = state;
+    }
+
+    pub fn record_outcome(&self, approved: bool) {
+        self.set(if approved {
+            ApprovalState::Approved
+        } else {
+            ApprovalState::Denied
+        });
+    }
+}
+
+type Notifier = dyn Fn(PairingRequestInfo, SharedConfig, Arc<PairingStatusHandle>) + Send + Sync;
 
 /// Bridges the HTTP pairing-activation handler (which must respond quickly)
 /// to whatever platform-specific "Approve this device?" UI is available, if
@@ -39,6 +95,7 @@ type Notifier = dyn Fn(PairingRequestInfo, SharedConfig) + Send + Sync;
 /// synchronously inside the HTTP handler.
 pub struct PairingCoordinator {
     notifier: Option<Arc<Notifier>>,
+    status: Arc<PairingStatusHandle>,
     last_prompt_at: Mutex<Option<Instant>>,
 }
 
@@ -46,6 +103,7 @@ impl PairingCoordinator {
     pub fn new(notifier: Option<Arc<Notifier>>) -> Self {
         Self {
             notifier,
+            status: Arc::new(PairingStatusHandle::default()),
             last_prompt_at: Mutex::new(None),
         }
     }
@@ -54,6 +112,10 @@ impl PairingCoordinator {
     /// service mode, or a platform build without a tray yet).
     pub fn unavailable() -> Self {
         Self::new(None)
+    }
+
+    pub fn approval_state(&self) -> ApprovalState {
+        self.status.get()
     }
 
     pub fn request(&self, info: PairingRequestInfo, config: SharedConfig) -> PairingOutcome {
@@ -74,10 +136,67 @@ impl PairingCoordinator {
         if should_prompt {
             *last_prompt_at = Some(now);
             drop(last_prompt_at);
+            self.status.set(ApprovalState::Pending);
             info!(peer = %info.peer, "WakeMATE showing a pairing confirmation prompt on the desktop");
-            notifier(info, config);
+            notifier(info, config, self.status.clone());
         }
 
         PairingOutcome::AwaitingApproval
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AppConfig;
+
+    fn shared_config() -> SharedConfig {
+        Arc::new(Mutex::new(AppConfig::default()))
+    }
+
+    #[test]
+    fn unavailable_coordinator_reports_idle_and_refuses_requests() {
+        let coordinator = PairingCoordinator::unavailable();
+        assert_eq!(coordinator.approval_state(), ApprovalState::Idle);
+
+        let outcome = coordinator.request(
+            PairingRequestInfo {
+                peer: "127.0.0.1".parse().unwrap(),
+            },
+            shared_config(),
+        );
+        assert_eq!(outcome, PairingOutcome::Unavailable);
+    }
+
+    #[test]
+    fn request_marks_pending_and_notifier_outcome_is_reported() {
+        let coordinator = PairingCoordinator::new(Some(Arc::new(
+            |_info, _config, status: Arc<PairingStatusHandle>| {
+                // The real notifier spawns a thread and records the human's
+                // answer later; recording synchronously here exercises the
+                // same path.
+                assert_eq!(status.get(), ApprovalState::Pending);
+                status.record_outcome(true);
+            },
+        )));
+
+        let outcome = coordinator.request(
+            PairingRequestInfo {
+                peer: "192.168.1.20".parse().unwrap(),
+            },
+            shared_config(),
+        );
+
+        assert_eq!(outcome, PairingOutcome::AwaitingApproval);
+        assert_eq!(coordinator.approval_state(), ApprovalState::Approved);
+    }
+
+    #[test]
+    fn denial_is_reported_until_the_next_prompt() {
+        let handle = PairingStatusHandle::default();
+        handle.set(ApprovalState::Pending);
+        handle.record_outcome(false);
+        assert_eq!(handle.get(), ApprovalState::Denied);
+        assert_eq!(handle.get().as_str(), "denied");
     }
 }

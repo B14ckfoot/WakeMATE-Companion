@@ -1,7 +1,11 @@
 use tokio::net::UdpSocket;
 use tracing::{error, warn};
 
-use crate::{config::SharedConfig, system, types::DiscoveryResponse};
+use crate::{
+    config::SharedConfig,
+    system,
+    types::{DiscoveryResponse, PROTOCOL_VERSION},
+};
 
 pub async fn run(config: SharedConfig) {
     let initial = match config.lock() {
@@ -59,6 +63,7 @@ pub async fn run(config: SharedConfig) {
             mac_address: network.as_ref().and_then(|info| info.mac_address.clone()),
             api_port,
             version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: PROTOCOL_VERSION,
         };
 
         let payload = match serde_json::to_vec(&response) {

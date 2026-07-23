@@ -2,6 +2,13 @@ use serde::{Deserialize, Serialize};
 
 pub const AUTH_HEADER: &str = "x-wakemate-token";
 
+/// Version of the mobile<->companion wire contract (command schema, QR
+/// payload, discovery reply). Bump on any breaking change so the mobile app
+/// can detect an incompatible companion instead of failing mid-command.
+/// History: 1 = implicit pre-versioning protocol; 2 = adds `mouse_button`,
+/// `/v1/pairing/status`, the JSON pairing-QR payload, and this field itself.
+pub const PROTOCOL_VERSION: u32 = 2;
+
 #[derive(Debug, Serialize)]
 pub struct ApiResponse<T: Serialize> {
     pub ok: bool,
@@ -43,6 +50,7 @@ pub struct HealthResponse {
     pub status: &'static str,
     pub device_name: String,
     pub version: String,
+    pub protocol_version: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -76,6 +84,7 @@ pub struct DiscoveryResponse {
     pub mac_address: Option<String>,
     pub api_port: u16,
     pub version: String,
+    pub protocol_version: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -86,6 +95,16 @@ pub struct PairingActivationResponse {
     /// prompt; poll `/v1/pairing/check` or `/v1/info` afterwards to see the
     /// flags flip to `true`.
     pub status: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PairingStatusResponse {
+    /// `"idle"` (no activation requested this session), `"pending"` (a
+    /// desktop prompt is showing), `"approved"`, or `"denied"`. Denials are
+    /// per-prompt, not permanent: a later activation shows a fresh prompt.
+    pub approval: &'static str,
+    pub allow_input_commands: bool,
+    pub allow_power_commands: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,6 +129,13 @@ pub enum CommandRequest {
     MouseClick {
         button: Option<MouseButtonArg>,
         double: Option<bool>,
+    },
+    /// Press or release a button without the paired click, so the phone can
+    /// drive drag/hold gestures. Matches what the mobile control screen has
+    /// always sent (`{"type":"mouse_button","button":"left","action":"down"}`).
+    MouseButton {
+        button: Option<MouseButtonArg>,
+        action: MouseButtonAction,
     },
     MouseScroll {
         direction: ScrollDirection,
@@ -139,6 +165,13 @@ pub enum MouseButtonArg {
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum MouseButtonAction {
+    Down,
+    Up,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ScrollDirection {
     Up,
     Down,
@@ -163,4 +196,66 @@ pub enum SystemAction {
     Shutdown,
     Lock,
     Logoff,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These fixtures are the exact bytes the mobile app sends (see
+    // Wakemate-Mobile/src/services/deviceService.ts, mapLegacyCommand).
+    // If one stops parsing, the mobile integration is broken.
+
+    #[test]
+    fn mouse_button_down_matches_the_mobile_wire_format() {
+        let parsed: CommandRequest =
+            serde_json::from_str(r#"{"type":"mouse_button","button":"left","action":"down"}"#)
+                .unwrap();
+        assert!(matches!(
+            parsed,
+            CommandRequest::MouseButton {
+                button: Some(MouseButtonArg::Left),
+                action: MouseButtonAction::Down,
+            }
+        ));
+    }
+
+    #[test]
+    fn mouse_button_up_matches_the_mobile_wire_format() {
+        let parsed: CommandRequest =
+            serde_json::from_str(r#"{"type":"mouse_button","button":"right","action":"up"}"#)
+                .unwrap();
+        assert!(matches!(
+            parsed,
+            CommandRequest::MouseButton {
+                button: Some(MouseButtonArg::Right),
+                action: MouseButtonAction::Up,
+            }
+        ));
+    }
+
+    #[test]
+    fn mouse_move_matches_the_mobile_wire_format() {
+        let parsed: CommandRequest =
+            serde_json::from_str(r#"{"type":"mouse_move","delta_x":12,"delta_y":-8}"#).unwrap();
+        assert!(matches!(
+            parsed,
+            CommandRequest::MouseMove {
+                delta_x: 12,
+                delta_y: -8,
+            }
+        ));
+    }
+
+    #[test]
+    fn health_response_includes_the_protocol_version() {
+        let response = HealthResponse {
+            status: "online",
+            device_name: "Desk Rig".to_string(),
+            version: "0.1.0".to_string(),
+            protocol_version: PROTOCOL_VERSION,
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["protocol_version"], PROTOCOL_VERSION);
+    }
 }

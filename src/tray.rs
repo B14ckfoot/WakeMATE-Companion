@@ -551,7 +551,7 @@ struct PairingPopup {
     window: Rc<Window>,
     _context: PopupContext,
     surface: PopupSurface,
-    token: String,
+    qr_payload: String,
     device_name: String,
     last_mouse_buttons: MouseButtons,
 }
@@ -596,11 +596,17 @@ impl PairingPopup {
         window.focus_window();
         window.request_redraw();
 
+        let qr_payload = pairing_qr_payload(
+            &snapshot.api_token,
+            &snapshot.device_name,
+            snapshot.bind_port(),
+        );
+
         Ok(Self {
             window,
             _context: context,
             surface,
-            token: snapshot.api_token,
+            qr_payload,
             device_name: snapshot.device_name,
             last_mouse_buttons: current_mouse_buttons(),
         })
@@ -644,7 +650,7 @@ impl PairingPopup {
             NonZeroU32::new(height).unwrap(),
         )?;
 
-        let frame = render_pairing_popup(&self.token, &self.device_name, width, height)
+        let frame = render_pairing_popup(&self.qr_payload, &self.device_name, width, height)
             .map_err(std::io::Error::other)?;
 
         let mut buffer = self.surface.buffer_mut()?;
@@ -775,13 +781,13 @@ fn monitor_bounds(monitor: &MonitorHandle) -> MonitorBounds {
 }
 
 fn render_pairing_popup(
-    token: &str,
+    qr_payload: &str,
     device_name: &str,
     width: u32,
     height: u32,
 ) -> Result<Vec<u32>, String> {
-    let qr = QrCode::encode_text(token, QrCodeEcc::Medium)
-        .map_err(|error| format!("failed to encode pairing token as QR: {error:?}"))?;
+    let qr = QrCode::encode_text(qr_payload, QrCodeEcc::Medium)
+        .map_err(|error| format!("failed to encode pairing payload as QR: {error:?}"))?;
     let layout = popup_layout(width, height, qr.size());
     let title_scale = text_scale(width);
     let subtitle_scale = title_scale.saturating_sub(1).max(1);
@@ -1343,9 +1349,55 @@ fn config_snapshot(config: &SharedConfig) -> Result<AppConfig, Box<dyn std::erro
 /// Shows the native "allow this device to pair?" prompt on its own thread
 /// (so the HTTP handler that triggered it never blocks) and, only on an
 /// explicit "Yes", flips on input/power control and persists it.
-fn windows_pairing_notifier(info: PairingRequestInfo, config: SharedConfig) {
+/// Builds the JSON payload encoded in the pairing QR code (pairing contract
+/// v2): everything the phone needs to save this computer and pair in one
+/// scan. Older mobile builds that JSON-parse the code and look for a `token`
+/// key keep working; the bare-token v1 format is superseded by this.
+fn pairing_qr_payload(token: &str, device_name: &str, api_port: u16) -> String {
+    let network = system::primary_network_info();
+    let ip = network
+        .as_ref()
+        .map(|info| info.local_ip.clone())
+        .or_else(system::local_ipv4);
+    let mac = network.as_ref().and_then(|info| info.mac_address.clone());
+
+    pairing_qr_payload_from_parts(token, device_name, api_port, ip, mac)
+}
+
+fn pairing_qr_payload_from_parts(
+    token: &str,
+    device_name: &str,
+    api_port: u16,
+    ip: Option<String>,
+    mac: Option<String>,
+) -> String {
+    let mut payload = serde_json::json!({
+        "v": 2,
+        "kind": "wakemate-pairing",
+        "name": device_name,
+        "api_port": api_port,
+        "token": token,
+        "protocol_version": crate::types::PROTOCOL_VERSION,
+    });
+
+    if let Some(ip) = ip {
+        payload["ip"] = serde_json::Value::String(ip);
+    }
+    if let Some(mac) = mac {
+        payload["mac"] = serde_json::Value::String(mac);
+    }
+
+    payload.to_string()
+}
+
+fn windows_pairing_notifier(
+    info: PairingRequestInfo,
+    config: SharedConfig,
+    status: Arc<crate::pairing::PairingStatusHandle>,
+) {
     thread::spawn(move || {
         let approved = system::confirm_pairing_dialog(&info.peer.to_string());
+        status.record_outcome(approved);
 
         if !approved {
             info!(peer = %info.peer, "WakeMATE pairing request denied on the desktop");
@@ -1457,8 +1509,9 @@ fn default_icon() -> Result<Icon, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_escape_press, popup_device_label, position_popup, render_pairing_popup,
-        screen_rect_contains_point, MonitorBounds, MouseButtons, PopupAnchor, ScreenPoint,
+        is_escape_press, pairing_qr_payload_from_parts, popup_device_label, position_popup,
+        render_pairing_popup, screen_rect_contains_point, MonitorBounds, MouseButtons, PopupAnchor,
+        ScreenPoint,
     };
     use winit::dpi::{PhysicalPosition, PhysicalSize};
     use winit::{
@@ -1511,6 +1564,51 @@ mod tests {
         let frame = render_pairing_popup("test-token", "Desk Rig", 252, 320).unwrap();
         assert_eq!(frame.len(), 252 * 320);
         assert!(frame.contains(&0x00111111));
+    }
+
+    #[test]
+    fn pairing_qr_payload_carries_the_v2_contract_fields() {
+        let payload = pairing_qr_payload_from_parts(
+            "token-value",
+            "Desk Rig",
+            7777,
+            Some("192.168.1.50".to_string()),
+            Some("00:11:22:33:44:55".to_string()),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+        assert_eq!(parsed["v"], 2);
+        assert_eq!(parsed["kind"], "wakemate-pairing");
+        assert_eq!(parsed["name"], "Desk Rig");
+        assert_eq!(parsed["api_port"], 7777);
+        assert_eq!(parsed["token"], "token-value");
+        assert_eq!(parsed["ip"], "192.168.1.50");
+        assert_eq!(parsed["mac"], "00:11:22:33:44:55");
+    }
+
+    #[test]
+    fn pairing_qr_payload_omits_unknown_network_fields() {
+        let payload = pairing_qr_payload_from_parts("token-value", "Desk Rig", 7777, None, None);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+        assert!(parsed.get("ip").is_none());
+        assert!(parsed.get("mac").is_none());
+        assert_eq!(parsed["token"], "token-value");
+    }
+
+    #[test]
+    fn render_pairing_popup_encodes_a_v2_payload() {
+        let payload = pairing_qr_payload_from_parts(
+            "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+            "Desk Rig",
+            7777,
+            Some("192.168.1.50".to_string()),
+            Some("00:11:22:33:44:55".to_string()),
+        );
+        // The payload is much longer than the old bare token; make sure it
+        // still fits in a QR code at the popup's render size.
+        let frame = render_pairing_popup(&payload, "Desk Rig", 252, 320).unwrap();
+        assert_eq!(frame.len(), (252 * 320) as usize);
     }
 
     #[test]

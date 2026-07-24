@@ -1,5 +1,6 @@
 /target
 /dist/installer
+/dist/release
 /wakemate.config.json
 /.DS_Store
 /installer/redist/innosetup-*.exe

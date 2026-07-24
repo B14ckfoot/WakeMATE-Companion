@@ -1,5 +1,5 @@
 #define MyAppName "WakeMATE Companion"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.2.0"
 #define MyAppPublisher "Marco Macias"
 #define MyAppURL "https://wakematemobile.com"
 #define MyAppExeName "wakemate-companion.exe"
@@ -32,10 +32,13 @@ WizardImageStretch=no
 LicenseFile=..\docs\EULA.txt
 InfoBeforeFile=INSTALL_WARNING.txt
 OutputDir=..\dist\installer
-OutputBaseFilename=WakeMATE+Companion+Setup
+OutputBaseFilename=WakeMATE-Companion-Setup-v{#MyAppVersion}
 
 ; Configure SignTool after you have a real signing certificate.
 ; SignTool=signtool.exe sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $f
+
+[Tasks]
+Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
 
 [Files]
 Source: "..\target\release\wakemate-companion.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -48,6 +51,7 @@ Source: "redist\{#MyVCRedistExe}"; DestDir: "{tmp}"; Flags: deleteafterinstall
 [Icons]
 Name: "{group}\WakeMATE Companion"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app-icon.ico"
 Name: "{group}\Uninstall WakeMATE Companion"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\WakeMATE Companion"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app-icon.ico"; Tasks: desktopicon
 
 [Run]
 Filename: "{tmp}\{#MyVCRedistExe}"; Parameters: "/install /quiet /norestart"; StatusMsg: "Installing Microsoft Visual C++ Runtime..."; Flags: waituntilterminated runhidden skipifdoesntexist; Check: NeedsVCRedist
@@ -66,6 +70,12 @@ Filename: "{app}\{#MyAppExeName}"; Description: "Launch WakeMATE Companion"; Fla
 Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""WakeMATE Companion Server"" /F"; Flags: runhidden skipifdoesntexist; RunOnceId: "RemoveBootTask"
 Filename: "{sys}\reg.exe"; Parameters: "delete ""HKCU\Software\Microsoft\Windows\CurrentVersion\Run"" /v ""WakeMATE Companion"" /f"; Flags: runhidden skipifdoesntexist; RunOnceId: "RemoveStartupRegistration"
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""WakeMATE Companion"""; Flags: runhidden; RunOnceId: "RemoveFirewallRule"
+
+[Messages]
+WelcomeLabel1=Welcome to [name] Setup
+WelcomeLabel2=Let's get your PC ready to wake up and connect.%n%nThis will install [name/ver] on your computer, so your WakeMATE mobile app can discover it, wake it from sleep, and (once you approve pairing) control it remotely.
+FinishedHeadingLabel=WakeMATE is ready to rise and connect
+FinishedLabel=[name] is installed on your computer. No snooze button required -- open the WakeMATE app on your phone and scan the pairing QR code from the tray icon to finish connecting.
 
 [Code]
 procedure InitializeWizard;

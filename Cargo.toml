@@ -1,6 +1,6 @@
 [package]
 name = "wakemate-companion"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "WakeMATE desktop companion for device discovery, Wake-on-LAN, and remote input control"
 

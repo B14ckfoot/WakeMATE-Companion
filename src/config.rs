@@ -63,14 +63,21 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn prepare_install_config_at_path(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let config = Self {
-            launch_on_startup: true,
-            allow_remote_connections: true,
-            allow_discovery: true,
-            ..Self::load_or_create_from_path(path)?
-        };
+        let mut config = Self::load_or_create_from_path(path)?;
+        config.apply_install_posture();
         config.save_to_path(path)?;
         Ok(config)
+    }
+
+    /// The settings an installed companion needs so a phone can pair by
+    /// scanning the QR code with no manual setup: reachable from the LAN,
+    /// discoverable, and running after reboots. Command capabilities are
+    /// deliberately NOT granted here -- those flip on when the person at the
+    /// desktop approves the pairing prompt.
+    fn apply_install_posture(&mut self) {
+        self.launch_on_startup = true;
+        self.allow_remote_connections = true;
+        self.allow_discovery = true;
     }
 
     pub fn load_or_create() -> Result<Self, Box<dyn std::error::Error>> {
@@ -107,6 +114,15 @@ impl AppConfig {
                 (Self::default(), true)
             }
         };
+
+        // A config file that existed but could not be read means this machine
+        // already went through setup. Recovering to the locked-down defaults
+        // would silently strand paired phones on a localhost-only server, so
+        // recovery restores the reachable install posture instead. Command
+        // capabilities still require a fresh pairing approval.
+        if recovered_from_error {
+            config.apply_install_posture();
+        }
 
         config.hydrate_token();
         if let Err(error) = config.save_to_path(path) {
@@ -466,8 +482,30 @@ mod tests {
         let config = AppConfig::load_or_create_from_path(&path).unwrap();
 
         assert_eq!(config.bind_address, DEFAULT_BIND_ADDRESS);
+        // A corrupt config means this machine was already set up, so recovery
+        // must keep the companion reachable for paired phones instead of
+        // silently retreating to localhost-only.
+        assert!(config.allow_remote_connections);
+        assert!(config.allow_discovery);
+        assert!(config.launch_on_startup);
+        assert!(!config.allow_input_commands);
+        assert!(!config.allow_power_commands);
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(serde_json::from_str::<serde_json::Value>(&raw).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_missing_config_file_keeps_the_locked_down_defaults() {
+        let dir =
+            std::env::temp_dir().join(format!("wakemate-config-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("wakemate.config.json");
+
+        let config = AppConfig::load_or_create_from_path(&path).unwrap();
+
+        assert!(!config.allow_remote_connections);
+        assert!(!config.allow_discovery);
+        assert_eq!(config.effective_bind_address(), "127.0.0.1:7777");
         std::fs::remove_dir_all(&dir).ok();
     }
 

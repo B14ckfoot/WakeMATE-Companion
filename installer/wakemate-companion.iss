@@ -51,12 +51,21 @@ Name: "{group}\Uninstall WakeMATE Companion"; Filename: "{uninstallexe}"
 
 [Run]
 Filename: "{tmp}\{#MyVCRedistExe}"; Parameters: "/install /quiet /norestart"; StatusMsg: "Installing Microsoft Visual C++ Runtime..."; Flags: waituntilterminated runhidden skipifdoesntexist; Check: NeedsVCRedist
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--prepare-install-config"; StatusMsg: "Preparing WakeMATE pairing settings..."; Flags: waituntilterminated runhidden; Check: NeedsFirstRunConfig
+; Runs on every install (not just the first) so reinstalling repairs a
+; corrupted or reset config: pairing must only ever need a QR scan.
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--prepare-install-config"; StatusMsg: "Preparing WakeMATE pairing settings..."; Flags: waituntilterminated runhidden
+; A program-scoped rule on every profile: home networks are usually Private,
+; so relying on Windows' one-time consent popup (which many people dismiss,
+; and which only covers the profile active at the time) leaves the phone
+; unable to reach the companion.
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""WakeMATE Companion"""; StatusMsg: "Configuring Windows Firewall..."; Flags: waituntilterminated runhidden
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""WakeMATE Companion"" dir=in action=allow program=""{app}\{#MyAppExeName}"" profile=any enable=yes"; StatusMsg: "Configuring Windows Firewall..."; Flags: waituntilterminated runhidden
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch WakeMATE Companion"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
 Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""WakeMATE Companion Server"" /F"; Flags: runhidden skipifdoesntexist; RunOnceId: "RemoveBootTask"
 Filename: "{sys}\reg.exe"; Parameters: "delete ""HKCU\Software\Microsoft\Windows\CurrentVersion\Run"" /v ""WakeMATE Companion"" /f"; Flags: runhidden skipifdoesntexist; RunOnceId: "RemoveStartupRegistration"
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""WakeMATE Companion"""; Flags: runhidden; RunOnceId: "RemoveFirewallRule"
 
 [Code]
 procedure InitializeWizard;
@@ -82,9 +91,4 @@ end;
 function NeedsVCRedist: Boolean;
 begin
   Result := not IsVCRedistInstalled;
-end;
-
-function NeedsFirstRunConfig: Boolean;
-begin
-  Result := not FileExists(ExpandConstant('{userappdata}\WakeMATE Companion\wakemate.config.json'));
 end;

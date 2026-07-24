@@ -59,6 +59,10 @@ pub struct PrimaryNetworkInfo {
 }
 
 pub fn local_ipv4() -> Option<String> {
+    route_probe_ipv4().or_else(first_interface_ipv4)
+}
+
+fn route_probe_ipv4() -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
 
@@ -66,6 +70,31 @@ pub fn local_ipv4() -> Option<String> {
         std::net::SocketAddr::V4(address) => Some(address.ip().to_string()),
         std::net::SocketAddr::V6(_) => None,
     }
+}
+
+/// Fallback when the routing probe cannot reach out (offline, VPN, or a
+/// firewall blocking outbound UDP): pick a LAN-looking IPv4 straight from
+/// the interface list so the pairing QR code still carries an address.
+fn first_interface_ipv4() -> Option<String> {
+    let interfaces = NetworkInterface::show().ok()?;
+    let candidates: Vec<Ipv4Addr> = interfaces
+        .iter()
+        .flat_map(|interface| interface.addr.iter())
+        .filter_map(|address| match address {
+            Addr::V4(details)
+                if !details.ip.is_loopback() && !details.ip.is_link_local() =>
+            {
+                Some(details.ip)
+            }
+            _ => None,
+        })
+        .collect();
+
+    candidates
+        .iter()
+        .find(|ip| ip.is_private())
+        .or_else(|| candidates.first())
+        .map(|ip| ip.to_string())
 }
 
 pub fn primary_network_info() -> Option<PrimaryNetworkInfo> {

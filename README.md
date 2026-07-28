@@ -105,7 +105,7 @@ WakeMATE has two behaviors:
 
 ### API summary
 
-Public: `GET /`, `GET /v1/health` (includes `protocol_version`, currently `2`).
+Public: `GET /`, `GET /v1/health` (includes `protocol_version`, currently `4`).
 Authenticated (`x-wakemate-token` header; per-IP rate-limited): `GET /v1/info`, `GET /v1/pairing/check`, `GET /v1/pairing/status` (returns `approval: idle|pending|approved|denied` plus the capability flags, so the phone can poll for the desktop's Yes/No), `POST /v1/pairing/activate` (returns `pending_approval`; grant happens only via the desktop dialog), `POST /v1/wake`, `POST /v1/command`.
 Discovery: UDP port `41234`, probe string `wakemate:discover`, JSON reply with device name, IP, MAC, legacy API port, TLS port, TLS fingerprint, version, and `protocol_version`; only active when remote access **and** discovery are both enabled. Discovery metadata is informational; the phone only trusts a fingerprint obtained through the visual QR channel.
 Pairing QR (contract v2): JSON `{"v":2,"kind":"wakemate-pairing","name":...,"ip":...,"api_port":...,"tls_port":...,"fp":...,"mac":...,"token":...,"protocol_version":2}`; `ip`/`mac` are omitted when the network can't be detected. `fp` is the lowercase SHA-256 digest of the leaf certificate's DER bytes.
@@ -116,11 +116,53 @@ Command payload examples (all `POST /v1/command`, snake_case tagged):
 { "type": "mouse_move", "delta_x": 12, "delta_y": -8 }
 { "type": "mouse_click", "button": "left", "double": false }
 { "type": "mouse_button", "button": "left", "action": "down" }
-{ "type": "key_press", "key": "CTRL+ALT+DELETE" }
+{ "type": "key_press", "key": "ctrl+c" }
 { "type": "text_input", "text": "hello from WakeMATE" }
 { "type": "media", "action": "play_pause" }
 { "type": "system", "action": "lock" }
+{ "type": "security_screen", "fallback": "lock" }
 ```
+
+#### Ctrl+Alt+Delete
+
+`key_press` **refuses** `ctrl+alt+delete` (in any order or spelling) with a
+`400`. Ctrl+Alt+Delete is the Windows Secure Attention Sequence: the real
+keystroke is claimed in kernel mode and handed to winlogon, and synthetic
+input is filtered out of that path, so sending it as keystrokes never opens
+the security screen — it only leaks a bare `Delete` into the focused window.
+
+Use `security_screen` instead. It asks Windows for the genuine sequence via
+`SendSAS` in `sas.dll`, which Microsoft gates on two conditions: the caller
+must be a service or a signed `uiAccess` app installed under `\Program
+Files\`, **and** the policy *Computer Configuration | Administrative
+Templates | Windows Components | Windows Logon Options | Disable or enable
+software Secure Attention Sequence* must permit it (registry value
+`SoftwareSASGeneration`: 0 none, 1 services, 2 Ease of Access apps, 3 both).
+The companion ships as an ordinary tray app, so on a stock machine neither
+holds and it reports that rather than pretending.
+
+`fallback` chooses what happens then: `"none"` (the default) leaves the
+desktop untouched, `"lock"` locks the workstation. The reply is always `200`
+with a structured body, because the HTTP status alone cannot distinguish a
+refusal from a failure:
+
+```json
+{
+  "ok": true,
+  "message": "security screen unavailable; fallback performed",
+  "data": {
+    "status": "success",
+    "action": "lock",
+    "fallback_used": true,
+    "detail": "Windows policy ... is off on this computer ..."
+  }
+}
+```
+
+`status` is one of `success`, `unsupported`, `permission_required`, or
+`execution_failed`; `action` is `secure_attention_sequence`, `lock`, or
+`none`. A rejected token is still a `401` and disabled power commands are
+still a `403`, as with every other command.
 
 Wake payload (`POST /v1/wake`): `{ "mac": "00:11:22:33:44:55", "broadcast": "255.255.255.255", "port": 9 }`
 

@@ -7,6 +7,8 @@ use axum::{
     Json, Router,
 };
 
+use tracing::{info, warn};
+
 use crate::{
     config::{AppConfig, SharedConfig},
     devices::SharedDeviceRegistry,
@@ -15,12 +17,14 @@ use crate::{
     pairing::{
         ApprovalState, PairingCoordinator, PairingOutcome, PairingRequestInfo, PendingEnrollment,
     },
+    secure_attention::{self, SasOutcome},
     security::{tokens_match, RateLimiter},
     system,
     types::{
         ApiResponse, CommandRequest, EnrollRequest, EnrollResponse, HealthResponse, InfoResponse,
-        PairingActivationResponse, PairingStatusQuery, PairingStatusResponse, WakeRequest,
-        AUTH_HEADER, PROTOCOL_VERSION,
+        PairingActivationResponse, PairingStatusQuery, PairingStatusResponse,
+        SecurityCommandAction, SecurityCommandResult, SecurityCommandStatus, SecurityFallback,
+        SystemAction, WakeRequest, AUTH_HEADER, PROTOCOL_VERSION,
     },
 };
 
@@ -301,9 +305,16 @@ async fn command(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<CommandRequest>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
+) -> Result<Json<ApiResponse<SecurityCommandResult>>, AppError> {
     let config = config_snapshot(&state.config)?;
     authenticate(&state, peer, &headers, &config.api_token)?;
+
+    // Handled ahead of the shared match because it is the one command that
+    // answers with a structured payload instead of a bare message.
+    if let CommandRequest::SecurityScreen { fallback } = request {
+        ensure_power_enabled(&state, &config)?;
+        return Ok(Json(security_screen(&state, fallback)));
+    }
 
     let input = InputController;
     let message = match request {
@@ -377,9 +388,115 @@ async fn command(
                 .map_err(AppError::unsupported)?
                 .to_string()
         }
+        // Returned above, before this match runs. Reported as an error rather
+        // than a panic so a future refactor that breaks that invariant fails
+        // one request instead of the connection.
+        CommandRequest::SecurityScreen { .. } => {
+            return Err(AppError::internal("security screen command was not dispatched"));
+        }
     };
 
-    Ok(Json(ApiResponse::message(message)))
+    Ok(Json(ApiResponse::ok_empty(message)))
+}
+
+/// Runs the Ctrl+Alt+Delete request and reports exactly what Windows did.
+///
+/// Answers `200 OK` in every case: the payload's `status` is the real result,
+/// and folding "Windows refused this" into an HTTP error would lose the
+/// distinction between a refusal, an unsupported OS, and a failed attempt.
+/// The caller is already authenticated and power-gated by this point.
+fn security_screen(state: &AppState, fallback: SecurityFallback) -> ApiResponse<SecurityCommandResult> {
+    info!(
+        fallback = ?fallback,
+        "security screen command authorized"
+    );
+
+    if state.headless {
+        // The pre-logon service instance has no interactive session, so there
+        // is no desktop for a security screen to appear on.
+        let result = SecurityCommandResult {
+            status: SecurityCommandStatus::Unsupported,
+            action: SecurityCommandAction::None,
+            fallback_used: false,
+            detail: "no one is signed in on this computer right now, so there is no desktop to show the security screen on".to_string(),
+        };
+        warn!(status = ?result.status, "security screen command refused");
+        return ApiResponse::failed("security screen unavailable", result);
+    }
+
+    let outcome = secure_attention::request_secure_attention_sequence();
+
+    let result = match outcome {
+        SasOutcome::Requested => SecurityCommandResult {
+            status: SecurityCommandStatus::Success,
+            action: SecurityCommandAction::SecureAttentionSequence,
+            fallback_used: false,
+            detail: "Windows accepted the Secure Attention Sequence".to_string(),
+        },
+        SasOutcome::Unsupported { detail } => {
+            apply_fallback(fallback, SecurityCommandStatus::Unsupported, detail)
+        }
+        SasOutcome::PermissionRequired { detail } => {
+            apply_fallback(fallback, SecurityCommandStatus::PermissionRequired, detail)
+        }
+        SasOutcome::Failed { detail } => {
+            apply_fallback(fallback, SecurityCommandStatus::ExecutionFailed, detail)
+        }
+    };
+
+    if result.status == SecurityCommandStatus::Success {
+        info!(
+            action = ?result.action,
+            fallback_used = result.fallback_used,
+            "security screen command completed"
+        );
+        let message = if result.fallback_used {
+            "security screen unavailable; fallback performed"
+        } else {
+            "security screen opened"
+        };
+        ApiResponse::ok(message, result)
+    } else {
+        warn!(
+            status = ?result.status,
+            detail = %result.detail,
+            "security screen command could not be completed"
+        );
+        ApiResponse::failed("security screen unavailable", result)
+    }
+}
+
+/// Turns a refused Secure Attention Sequence into whatever substitute the
+/// caller explicitly opted into. With no fallback the desktop is left
+/// untouched and the original refusal is reported unchanged, so a phone can
+/// never trigger a surprise lock it did not ask for.
+fn apply_fallback(
+    fallback: SecurityFallback,
+    status: SecurityCommandStatus,
+    detail: String,
+) -> SecurityCommandResult {
+    match fallback {
+        SecurityFallback::None => SecurityCommandResult {
+            status,
+            action: SecurityCommandAction::None,
+            fallback_used: false,
+            detail,
+        },
+        SecurityFallback::Lock => match system::perform_system_action(SystemAction::Lock) {
+            Ok(_) => SecurityCommandResult {
+                status: SecurityCommandStatus::Success,
+                action: SecurityCommandAction::Lock,
+                fallback_used: true,
+                detail,
+            },
+            Err(error) => SecurityCommandResult {
+                status: SecurityCommandStatus::ExecutionFailed,
+                action: SecurityCommandAction::None,
+                fallback_used: false,
+                detail: format!("{detail} Locking the computer instead also failed: {error}"),
+            },
+        },
+    }
 }
 
 /// Validates the pairing credential -- either the shared QR token or any

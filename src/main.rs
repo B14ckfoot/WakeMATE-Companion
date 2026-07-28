@@ -8,6 +8,7 @@ mod discovery;
 mod error;
 mod input;
 mod pairing;
+mod secure_attention;
 mod security;
 mod system;
 mod theme;

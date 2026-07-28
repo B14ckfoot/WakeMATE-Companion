@@ -66,6 +66,10 @@ impl InputController {
                 return Err("key combination is empty".to_string());
             }
 
+            if is_secure_attention_combo(&parts) {
+                return Err(SECURE_ATTENTION_REJECTION.to_string());
+            }
+
             for modifier in parts.iter().take(parts.len().saturating_sub(1)) {
                 let parsed = parse_key(modifier)
                     .ok_or_else(|| format!("unsupported modifier: {modifier}"))?;
@@ -108,6 +112,42 @@ impl InputController {
 
         self.key_press(key_name)
     }
+}
+
+/// Sent back when a caller tries to type the Secure Attention Sequence.
+/// Names the supported command so an older phone build gets a usable message
+/// rather than a dead end.
+pub const SECURE_ATTENTION_REJECTION: &str =
+    "Ctrl+Alt+Delete cannot be sent as keystrokes; use the security_screen command instead";
+
+/// True for Ctrl+Alt+Delete in any order or spelling.
+///
+/// Windows claims the real sequence in kernel mode and filters synthetic
+/// input out of it, so pressing these three through `SendInput` never reaches
+/// winlogon. What it *does* do is deliver a bare Delete to whatever window
+/// has focus while Ctrl and Alt are held -- destroying a selection, a file, or
+/// a row of a table with no way to tell the user it happened. Refusing is
+/// both the honest answer and the safe one; [`crate::secure_attention`]
+/// explains the sanctioned alternative.
+fn is_secure_attention_combo(parts: &[&str]) -> bool {
+    if parts.len() != 3 {
+        return false;
+    }
+
+    let mut has_control = false;
+    let mut has_alt = false;
+    let mut has_delete = false;
+
+    for part in parts {
+        match part.trim().to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => has_control = true,
+            "alt" => has_alt = true,
+            "delete" | "del" => has_delete = true,
+            _ => return false,
+        }
+    }
+
+    has_control && has_alt && has_delete
 }
 
 fn map_mouse_button(button: MouseButtonArg) -> MouseButton {
@@ -155,10 +195,53 @@ fn parse_key(raw: &str) -> Option<Key> {
         "volumeup" => Some(Key::VolumeUp),
         "volumedown" => Some(Key::VolumeDown),
         "mute" | "volumemute" => Some(Key::VolumeMute),
+        // enigo only defines the transport keys on Windows and Linux, so
+        // these arms have to carry the same gate or the crate stops compiling
+        // on a macOS dev machine -- which is where the tests get run.
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         "playpause" | "mediaplaypause" => Some(Key::MediaPlayPause),
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         "nexttrack" | "medianexttrack" => Some(Key::MediaNextTrack),
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         "prevtrack" | "previoustrack" | "mediaprevtrack" => Some(Key::MediaPrevTrack),
         _ if key.chars().count() == 1 => Some(Key::Layout(key.chars().next()?)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_secure_attention_combo;
+
+    #[test]
+    fn detects_the_secure_attention_sequence_in_any_spelling_or_order() {
+        for combo in [
+            vec!["ctrl", "alt", "delete"],
+            vec!["control", "alt", "del"],
+            vec!["CTRL", "Alt", "Delete"],
+            vec!["delete", "ctrl", "alt"],
+            vec!["alt", "delete", "control"],
+        ] {
+            assert!(
+                is_secure_attention_combo(&combo),
+                "{combo:?} is Ctrl+Alt+Delete and must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn leaves_ordinary_shortcuts_alone() {
+        for combo in [
+            vec!["ctrl", "c"],
+            vec!["ctrl", "alt", "t"],
+            vec!["ctrl", "shift", "delete"],
+            vec!["alt", "delete"],
+            vec!["ctrl", "alt", "shift", "delete"],
+        ] {
+            assert!(
+                !is_secure_attention_combo(&combo),
+                "{combo:?} is a normal shortcut and must still be sent"
+            );
+        }
     }
 }

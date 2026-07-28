@@ -8,8 +8,9 @@ pub const AUTH_HEADER: &str = "x-wakemate-token";
 /// History: 1 = implicit pre-versioning protocol; 2 = adds `mouse_button`,
 /// `/v1/pairing/status`, the JSON pairing-QR payload, and this field itself;
 /// 3 = adds `/v1/pairing/enroll` per-device tokens and the `device_id` query
-/// on `/v1/pairing/status`.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// on `/v1/pairing/status`; 4 = adds the `security_screen` command and stops
+/// accepting `ctrl+alt+delete` as a `key_press`.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Serialize)]
 pub struct ApiResponse<T: Serialize> {
@@ -23,6 +24,28 @@ impl<T: Serialize> ApiResponse<T> {
     pub fn ok(message: impl Into<String>, data: T) -> Self {
         Self {
             ok: true,
+            message: message.into(),
+            data: Some(data),
+        }
+    }
+
+    /// Success with no payload, for endpoints whose response type is generic
+    /// because *some* of their outcomes carry data. `data` is skipped during
+    /// serialization, so the wire format is unchanged for the others.
+    pub fn ok_empty(message: impl Into<String>) -> Self {
+        Self {
+            ok: true,
+            message: message.into(),
+            data: None,
+        }
+    }
+
+    /// A completed request whose outcome was not success -- used where the
+    /// payload itself explains the failure and an HTTP error status would
+    /// throw away that detail.
+    pub fn failed(message: impl Into<String>, data: T) -> Self {
+        Self {
+            ok: false,
             message: message.into(),
             data: Some(data),
         }
@@ -184,6 +207,74 @@ pub enum CommandRequest {
     System {
         action: SystemAction,
     },
+    /// Ask Windows to show the Ctrl+Alt+Delete security screen.
+    ///
+    /// This is deliberately *not* a `key_press`: Windows filters synthetic
+    /// Ctrl+Alt+Delete out of the Secure Attention Sequence path, so sending
+    /// it as keystrokes silently does nothing useful (see
+    /// `crate::secure_attention`). Unlike every other command, this one
+    /// answers `200 OK` with a [`SecurityCommandResult`] describing what
+    /// actually happened, so the phone never has to infer success from a
+    /// status code.
+    SecurityScreen {
+        /// What to do when Windows refuses the real sequence. Defaults to
+        /// [`SecurityFallback::None`], which changes nothing on the desktop
+        /// and reports `permission_required`, so a caller only ever gets the
+        /// substitute action it explicitly asked for.
+        #[serde(default)]
+        fallback: SecurityFallback,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityFallback {
+    #[default]
+    None,
+    /// Lock the workstation -- the one thing a remote user reliably wants
+    /// Ctrl+Alt+Delete for that a desktop app is actually allowed to do.
+    Lock,
+}
+
+/// Outcome vocabulary shared with the mobile app. `unauthorized` and
+/// `offline` are not produced here: a bad token is a `401` from
+/// [`crate::app`], and an unreachable companion never answers at all, so the
+/// phone derives those two from the transport.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityCommandStatus {
+    /// The requested action, or the caller's chosen fallback, was carried out.
+    Success,
+    /// This companion's OS has no equivalent action.
+    Unsupported,
+    /// The action exists but Windows will not let this companion perform it.
+    PermissionRequired,
+    /// Eligible and attempted, but it failed.
+    ExecutionFailed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityCommandAction {
+    /// Windows raised the real Ctrl+Alt+Delete security screen.
+    SecureAttentionSequence,
+    /// The workstation was locked instead.
+    Lock,
+    /// Nothing was done to the desktop.
+    None,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SecurityCommandResult {
+    pub status: SecurityCommandStatus,
+    /// What actually happened, which is not always what was requested.
+    pub action: SecurityCommandAction,
+    /// True when `action` is the caller's fallback rather than the real
+    /// sequence, so the phone can tell the user the plain truth.
+    pub fallback_used: bool,
+    /// Operator-facing explanation. Safe to surface: it never contains
+    /// tokens, paths, or peer addresses.
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -276,6 +367,92 @@ mod tests {
                 delta_y: -8,
             }
         ));
+    }
+
+    #[test]
+    fn security_screen_matches_the_mobile_wire_format() {
+        let parsed: CommandRequest =
+            serde_json::from_str(r#"{"type":"security_screen","fallback":"lock"}"#).unwrap();
+        assert!(matches!(
+            parsed,
+            CommandRequest::SecurityScreen {
+                fallback: SecurityFallback::Lock,
+            }
+        ));
+    }
+
+    #[test]
+    fn security_screen_without_a_fallback_defaults_to_touching_nothing() {
+        let parsed: CommandRequest =
+            serde_json::from_str(r#"{"type":"security_screen"}"#).unwrap();
+        assert!(matches!(
+            parsed,
+            CommandRequest::SecurityScreen {
+                fallback: SecurityFallback::None,
+            }
+        ));
+    }
+
+    #[test]
+    fn unknown_command_types_are_rejected_rather_than_guessed_at() {
+        // The tagged enum is the command allowlist; anything outside it must
+        // fail to parse instead of reaching an execution path.
+        for payload in [
+            r#"{"type":"ctrl_alt_delete"}"#,
+            r#"{"type":"exec","command":"calc.exe"}"#,
+            r#"{"type":"security_screen","fallback":"shutdown"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<CommandRequest>(payload).is_err(),
+                "{payload} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn security_result_serializes_the_statuses_the_mobile_app_switches_on() {
+        let json = serde_json::to_value(SecurityCommandResult {
+            status: SecurityCommandStatus::PermissionRequired,
+            action: SecurityCommandAction::None,
+            fallback_used: false,
+            detail: "policy is off".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(json["status"], "permission_required");
+        assert_eq!(json["action"], "none");
+        assert_eq!(json["fallback_used"], false);
+    }
+
+    #[test]
+    fn a_failed_response_still_carries_its_payload() {
+        // The phone needs `status` even when the command did not succeed, so
+        // this response must not collapse to a bare error message.
+        let response = ApiResponse::failed(
+            "security screen unavailable",
+            SecurityCommandResult {
+                status: SecurityCommandStatus::Unsupported,
+                action: SecurityCommandAction::None,
+                fallback_used: false,
+                detail: "not Windows".to_string(),
+            },
+        );
+        let json = serde_json::to_value(&response).unwrap();
+
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["data"]["status"], "unsupported");
+    }
+
+    #[test]
+    fn responses_without_data_do_not_emit_a_data_field() {
+        // Every other command shares this response type now; their wire
+        // format must be byte-identical to before.
+        let response = ApiResponse::<SecurityCommandResult>::ok_empty("mouse click sent");
+        let json = serde_json::to_value(&response).unwrap();
+
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["message"], "mouse click sent");
+        assert!(json.get("data").is_none());
     }
 
     #[test]

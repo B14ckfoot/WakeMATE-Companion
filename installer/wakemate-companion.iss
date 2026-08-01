@@ -1,5 +1,5 @@
 #define MyAppName "WakeMATE Companion"
-#define MyAppVersion "0.2.0"
+#define MyAppVersion "0.2.2"
 #define MyAppPublisher "Marco Macias"
 #define MyAppURL "https://wakematemobile.com"
 #define MyAppExeName "wakemate-companion.exe"
@@ -24,6 +24,9 @@ SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
 ChangesAssociations=no
+CloseApplications=force
+CloseApplicationsFilter={#MyAppExeName}
+RestartApplications=no
 UninstallDisplayIcon={app}\app-icon.ico
 SetupIconFile=..\assets\app-icon.ico
 WizardImageFile=branding\wizard-image.png,branding\wizard-image-2x.png
@@ -78,6 +81,36 @@ FinishedHeadingLabel=WakeMATE is ready to rise and connect
 FinishedLabel=[name] is installed on your computer. No snooze button required -- open the WakeMATE app on your phone and scan the pairing QR code from the tray icon to finish connecting.
 
 [Code]
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ExitCode: Integer;
+begin
+  Result := '';
+
+  { The tray application has no ordinary window for Restart Manager to close,
+    so stop it explicitly before Setup replaces the executable. This also
+    handles a companion started by the pre-logon scheduled task. }
+  if not Exec(
+    ExpandConstant('{sys}\taskkill.exe'),
+    '/F /T /IM "{#MyAppExeName}"',
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ExitCode
+  ) then
+  begin
+    Result := 'Setup could not start the Windows process closer. Close WakeMATE Companion from the system tray, then try again.';
+  end
+  else if (ExitCode <> 0) and (ExitCode <> 128) then
+  begin
+    Result := 'Setup could not close the running WakeMATE Companion. Close it from the system tray, then try again.';
+  end
+  else
+  begin
+    Sleep(500);
+  end;
+end;
+
 procedure InitializeWizard;
 begin
   { WakeMATE brand cyan (src/theme.rs PRIMARY, #0891B2), in Delphi's $00BBGGRR order. }

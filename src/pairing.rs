@@ -19,6 +19,11 @@ const PROMPT_COOLDOWN: Duration = Duration::from_secs(10);
 /// silently register the stale device.
 const ENROLLMENT_TTL: Duration = Duration::from_secs(120);
 
+/// How long a one-time pairing-session token (the credential embedded in the
+/// pairing QR code / Universal Link, as opposed to the permanent shared
+/// `api_token`) stays claimable after being minted.
+const PAIRING_SESSION_TTL: Duration = Duration::from_secs(600);
+
 #[derive(Debug, Clone, Copy)]
 pub struct PairingRequestInfo {
     pub peer: IpAddr,
@@ -122,6 +127,84 @@ impl EnrollmentSlot {
     }
 }
 
+/// A one-time credential embedded in the pairing QR code / Universal Link
+/// instead of the permanent shared `api_token`, so a photo of the QR code or
+/// a leaked pairing link cannot be replayed indefinitely to enroll new
+/// devices. Read-only checks (`matches`, used by `/v1/pairing/status`) never
+/// expire it early; only a state-changing pairing action (`try_consume`,
+/// used by `/v1/pairing/enroll` and `/v1/pairing/activate`) burns it, so a
+/// phone can still poll for approval after the token that started the
+/// enrollment has already been consumed.
+struct PairingSession {
+    token: String,
+    minted_at: Instant,
+    consumed: bool,
+}
+
+impl PairingSession {
+    fn expired(&self) -> bool {
+        self.minted_at.elapsed() > PAIRING_SESSION_TTL
+    }
+}
+
+/// Holds at most one live pairing-session token. Minted fresh each time the
+/// desktop shows a new pairing QR code (see `tray.rs`); a stale token from a
+/// previous QR display stops matching as soon as a new one is minted.
+#[derive(Default)]
+pub struct PairingSessionSlot {
+    slot: Mutex<Option<PairingSession>>,
+}
+
+impl PairingSessionSlot {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<PairingSession>> {
+        self.slot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Mints a fresh one-time token, replacing any previous one.
+    pub fn mint(&self) -> String {
+        let token = uuid::Uuid::new_v4().to_string();
+        *self.lock() = Some(PairingSession {
+            token: token.clone(),
+            minted_at: Instant::now(),
+            consumed: false,
+        });
+        token
+    }
+
+    /// Non-consuming check: true while the current token is unexpired,
+    /// regardless of whether it has already been used to start an
+    /// enrollment. Used for `/v1/pairing/status`, which a phone polls
+    /// repeatedly with the same token while waiting for desktop approval.
+    pub fn matches(&self, candidate: &str) -> bool {
+        let guard = self.lock();
+        guard
+            .as_ref()
+            .filter(|session| !session.expired())
+            .map(|session| crate::security::tokens_match(candidate, &session.token))
+            .unwrap_or(false)
+    }
+
+    /// Consumes the token for a state-changing pairing action. Returns
+    /// `true` at most once per minted token, so a leaked QR code or link
+    /// cannot be replayed to enroll unlimited devices after the first use.
+    pub fn try_consume(&self, candidate: &str) -> bool {
+        let mut guard = self.lock();
+        let Some(session) = guard.as_mut() else {
+            return false;
+        };
+        if session.consumed || session.expired() {
+            return false;
+        }
+        if !crate::security::tokens_match(candidate, &session.token) {
+            return false;
+        }
+        session.consumed = true;
+        true
+    }
+}
+
 /// Where the most recent pairing-activation prompt stands, so the phone can
 /// poll `/v1/pairing/status` and show a truthful pending/approved/denied
 /// state instead of assuming success. A denial is per-prompt, not permanent:
@@ -201,6 +284,7 @@ pub struct PairingCoordinator {
     notifier: Option<Arc<Notifier>>,
     status: Arc<PairingStatusHandle>,
     enrollment: Arc<EnrollmentSlot>,
+    session: Arc<PairingSessionSlot>,
     last_prompt_at: Mutex<Option<Instant>>,
 }
 
@@ -210,8 +294,28 @@ impl PairingCoordinator {
             notifier,
             status: Arc::new(PairingStatusHandle::default()),
             enrollment: Arc::new(EnrollmentSlot::default()),
+            session: Arc::new(PairingSessionSlot::default()),
             last_prompt_at: Mutex::new(None),
         }
+    }
+
+    /// Mints a fresh one-time pairing-session token for a newly displayed QR
+    /// code / Universal Link, replacing whatever token (if any) was minted
+    /// for a previous QR display.
+    pub fn mint_pairing_session_token(&self) -> String {
+        self.session.mint()
+    }
+
+    /// Non-consuming check for the current pairing-session token. See
+    /// [`PairingSessionSlot::matches`].
+    pub fn pairing_session_matches(&self, candidate: &str) -> bool {
+        self.session.matches(candidate)
+    }
+
+    /// Consumes the current pairing-session token for a state-changing
+    /// pairing action. See [`PairingSessionSlot::try_consume`].
+    pub fn consume_pairing_session_token(&self, candidate: &str) -> bool {
+        self.session.try_consume(candidate)
     }
 
     /// No desktop UI is available to confirm pairing (headless / pre-logon
@@ -431,5 +535,68 @@ mod tests {
         handle.record_outcome(false);
         assert_eq!(handle.get(), ApprovalState::Denied);
         assert_eq!(handle.get().as_str(), "denied");
+    }
+
+    #[test]
+    fn pairing_session_token_matches_after_minting() {
+        let slot = PairingSessionSlot::default();
+        let token = slot.mint();
+        assert!(slot.matches(&token));
+        assert!(!slot.matches("some-other-token"));
+    }
+
+    #[test]
+    fn pairing_session_token_can_only_be_consumed_once() {
+        let slot = PairingSessionSlot::default();
+        let token = slot.mint();
+        assert!(slot.try_consume(&token));
+        assert!(!slot.try_consume(&token));
+    }
+
+    #[test]
+    fn pairing_session_token_still_matches_read_only_after_being_consumed() {
+        // /v1/pairing/status polls repeatedly with the same token while
+        // waiting for desktop approval; only the state-changing enroll /
+        // activate actions burn it.
+        let slot = PairingSessionSlot::default();
+        let token = slot.mint();
+        assert!(slot.try_consume(&token));
+        assert!(slot.matches(&token));
+    }
+
+    #[test]
+    fn minting_a_new_pairing_session_token_invalidates_the_previous_one() {
+        let slot = PairingSessionSlot::default();
+        let first = slot.mint();
+        let second = slot.mint();
+
+        assert!(!slot.matches(&first));
+        assert!(slot.matches(&second));
+    }
+
+    #[test]
+    fn expired_pairing_session_token_is_rejected() {
+        let slot = PairingSessionSlot::default();
+        let token = slot.mint();
+        if let Some(session) = slot.lock().as_mut() {
+            session.minted_at = Instant::now()
+                .checked_sub(PAIRING_SESSION_TTL + Duration::from_secs(1))
+                .unwrap();
+        }
+
+        assert!(!slot.matches(&token));
+        assert!(!slot.try_consume(&token));
+    }
+
+    #[test]
+    fn coordinator_mints_and_consumes_pairing_session_tokens() {
+        let coordinator = PairingCoordinator::unavailable();
+        let token = coordinator.mint_pairing_session_token();
+
+        assert!(coordinator.pairing_session_matches(&token));
+        assert!(coordinator.consume_pairing_session_token(&token));
+        assert!(!coordinator.consume_pairing_session_token(&token));
+        // Still readable after being consumed once, for status polling.
+        assert!(coordinator.pairing_session_matches(&token));
     }
 }

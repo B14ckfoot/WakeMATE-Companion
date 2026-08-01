@@ -148,7 +148,7 @@ async fn pairing_status(
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<PairingStatusResponse>>, AppError> {
     let config = config_snapshot(&state.config)?;
-    authenticate(&state, peer, &headers, &config.api_token)?;
+    authenticate_pairing_status(&state, peer, &headers, &config.api_token)?;
 
     let device_id = query
         .device_id
@@ -252,7 +252,7 @@ async fn pairing_activate(
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<PairingActivationResponse>>, AppError> {
     let config = config_snapshot(&state.config)?;
-    authenticate(&state, peer, &headers, &config.api_token)?;
+    authenticate_pairing_activate(&state, peer, &headers, &config.api_token)?;
 
     if state.headless {
         return Err(AppError::forbidden(
@@ -392,7 +392,9 @@ async fn command(
         // than a panic so a future refactor that breaks that invariant fails
         // one request instead of the connection.
         CommandRequest::SecurityScreen { .. } => {
-            return Err(AppError::internal("security screen command was not dispatched"));
+            return Err(AppError::internal(
+                "security screen command was not dispatched",
+            ));
         }
     };
 
@@ -405,7 +407,10 @@ async fn command(
 /// and folding "Windows refused this" into an HTTP error would lose the
 /// distinction between a refusal, an unsupported OS, and a failed attempt.
 /// The caller is already authenticated and power-gated by this point.
-fn security_screen(state: &AppState, fallback: SecurityFallback) -> ApiResponse<SecurityCommandResult> {
+fn security_screen(
+    state: &AppState,
+    fallback: SecurityFallback,
+) -> ApiResponse<SecurityCommandResult> {
     info!(
         fallback = ?fallback,
         "security screen command authorized"
@@ -499,9 +504,27 @@ fn apply_fallback(
     }
 }
 
-/// Validates the pairing credential -- either the shared QR token or any
-/// approved per-device token -- with constant-time comparisons, and applies
-/// the per-IP lockout so a stolen or guessed token cannot be brute-forced by
+/// How `authenticate_inner` treats the one-time pairing-session token (the
+/// credential embedded in the pairing QR code / Universal Link) in addition
+/// to the permanent shared `api_token`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionTokenMode {
+    /// Not accepted at all (`/v1/wake`, `/v1/command`, `/v1/info`): the
+    /// pairing-session token is scoped to the pairing endpoints only.
+    None,
+    /// Accepted without being consumed (`/v1/pairing/status`), since a phone
+    /// polls this repeatedly with the same token while waiting for desktop
+    /// approval.
+    ReadOnly,
+    /// Accepted and burned on success (`/v1/pairing/enroll`,
+    /// `/v1/pairing/activate`), so a leaked QR code or link cannot be
+    /// replayed to start unlimited pairing attempts.
+    Consume,
+}
+
+/// Validates the pairing credential -- the shared QR token or any approved
+/// per-device token -- with constant-time comparisons, and applies the
+/// per-IP lockout so a stolen or guessed token cannot be brute-forced by
 /// hammering any authenticated endpoint.
 fn authenticate(
     state: &AppState,
@@ -509,18 +532,73 @@ fn authenticate(
     headers: &HeaderMap,
     expected_token: &str,
 ) -> Result<(), AppError> {
-    authenticate_inner(state, peer, headers, expected_token, true)
+    authenticate_inner(
+        state,
+        peer,
+        headers,
+        expected_token,
+        true,
+        SessionTokenMode::None,
+    )
 }
 
-/// Like `authenticate`, but only the shared QR token is accepted. Used by
-/// enrollment so a per-device token can never mint further device tokens.
+/// Like `authenticate`, but only the shared QR token or a valid one-time
+/// pairing-session token is accepted -- never a per-device token, so an
+/// already-approved phone can never mint further device tokens for other
+/// phones. The session token is consumed on success.
 fn authenticate_shared_only(
     state: &AppState,
     peer: SocketAddr,
     headers: &HeaderMap,
     expected_token: &str,
 ) -> Result<(), AppError> {
-    authenticate_inner(state, peer, headers, expected_token, false)
+    authenticate_inner(
+        state,
+        peer,
+        headers,
+        expected_token,
+        false,
+        SessionTokenMode::Consume,
+    )
+}
+
+/// Used by `/v1/pairing/status`: accepts the shared token, an approved
+/// device token, or the current pairing-session token, without consuming
+/// the session token -- a phone polls this endpoint repeatedly with the same
+/// token while waiting for the desktop prompt to be answered.
+fn authenticate_pairing_status(
+    state: &AppState,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+    expected_token: &str,
+) -> Result<(), AppError> {
+    authenticate_inner(
+        state,
+        peer,
+        headers,
+        expected_token,
+        true,
+        SessionTokenMode::ReadOnly,
+    )
+}
+
+/// Used by `/v1/pairing/activate` (the legacy, non-per-device pairing
+/// flow): accepts the shared token, an approved device token, or the
+/// current pairing-session token, consuming the session token on success.
+fn authenticate_pairing_activate(
+    state: &AppState,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+    expected_token: &str,
+) -> Result<(), AppError> {
+    authenticate_inner(
+        state,
+        peer,
+        headers,
+        expected_token,
+        true,
+        SessionTokenMode::Consume,
+    )
 }
 
 fn authenticate_inner(
@@ -529,6 +607,7 @@ fn authenticate_inner(
     headers: &HeaderMap,
     expected_token: &str,
     accept_device_tokens: bool,
+    session_mode: SessionTokenMode,
 ) -> Result<(), AppError> {
     if let Some(remaining) = state.rate_limiter.locked_out(peer.ip()) {
         return Err(AppError::too_many_requests(format!(
@@ -545,6 +624,19 @@ fn authenticate_inner(
         .map(|provided| {
             if tokens_match(provided, expected_token) {
                 return true;
+            }
+            match session_mode {
+                SessionTokenMode::None => {}
+                SessionTokenMode::ReadOnly => {
+                    if state.pairing.pairing_session_matches(provided) {
+                        return true;
+                    }
+                }
+                SessionTokenMode::Consume => {
+                    if state.pairing.consume_pairing_session_token(provided) {
+                        return true;
+                    }
+                }
             }
             if !accept_device_tokens {
                 return false;

@@ -1,15 +1,13 @@
 use std::{
-    ffi::OsStr,
-    net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket},
+    net::{Ipv4Addr, UdpSocket},
     path::Path,
     process::Command,
-    time::Duration,
 };
 
 use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
 
 #[cfg(target_os = "windows")]
-use std::{os::windows::ffi::OsStrExt, ptr};
+use std::{ffi::OsStr, os::windows::ffi::OsStrExt, ptr};
 
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::{
@@ -40,8 +38,6 @@ const DEFAULT_WOL_PORT: u16 = 9;
 const WINDOWS_RUN_KEY_PATH: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 #[cfg(target_os = "windows")]
 const WINDOWS_RUN_VALUE_NAME: &str = "WakeMATE Companion";
-#[cfg(target_os = "windows")]
-const WINDOWS_BOOT_TASK_NAME: &str = "WakeMATE Companion Server";
 #[cfg(target_os = "windows")]
 const UXTHEME_ORDINAL_SET_PREFERRED_APP_MODE: usize = 135;
 #[cfg(target_os = "windows")]
@@ -81,9 +77,7 @@ fn first_interface_ipv4() -> Option<String> {
         .iter()
         .flat_map(|interface| interface.addr.iter())
         .filter_map(|address| match address {
-            Addr::V4(details)
-                if !details.ip.is_loopback() && !details.ip.is_link_local() =>
-            {
+            Addr::V4(details) if !details.ip.is_loopback() && !details.ip.is_link_local() => {
                 Some(details.ip)
             }
             _ => None,
@@ -105,15 +99,6 @@ pub fn primary_network_info() -> Option<PrimaryNetworkInfo> {
     interfaces
         .into_iter()
         .find_map(|interface| interface_to_primary_info(interface, local_ip_addr))
-}
-
-pub fn server_is_reachable(bind_address: &str) -> bool {
-    let probe = loopback_probe_address(bind_address);
-    let Some(address) = probe.parse::<SocketAddr>().ok() else {
-        return false;
-    };
-
-    TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok()
 }
 
 pub fn send_wol(mac: &str, broadcast: &str, port: u16) -> Result<(), String> {
@@ -155,14 +140,6 @@ fn interface_to_primary_info(
     })
 }
 
-fn loopback_probe_address(bind_address: &str) -> String {
-    if let Some(port) = bind_address.rsplit(':').next() {
-        format!("127.0.0.1:{port}")
-    } else {
-        bind_address.to_string()
-    }
-}
-
 pub fn perform_system_action(action: SystemAction) -> Result<&'static str, String> {
     match action {
         SystemAction::Sleep => sleep(),
@@ -195,20 +172,6 @@ pub fn enable_preferred_dark_mode() -> bool {
     #[cfg(not(target_os = "windows"))]
     {
         false
-    }
-}
-
-pub fn sync_prelogon_server_task(enabled: bool, config_path: &Path) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        sync_prelogon_server_task_windows(enabled, config_path)
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = enabled;
-        let _ = config_path;
-        Ok(())
     }
 }
 
@@ -321,53 +284,6 @@ fn open_windows_run_key() -> Result<HKEY, String> {
 #[cfg(target_os = "windows")]
 fn startup_command(exe_path: &Path) -> String {
     format!("\"{}\"", exe_path.display())
-}
-
-#[cfg(target_os = "windows")]
-fn sync_prelogon_server_task_windows(enabled: bool, config_path: &Path) -> Result<(), String> {
-    let exe_path = std::env::current_exe().map_err(|error| error.to_string())?;
-
-    if enabled {
-        let task_command = scheduled_task_command(&exe_path, config_path);
-        run(
-            "schtasks.exe",
-            &[
-                "/Create",
-                "/TN",
-                WINDOWS_BOOT_TASK_NAME,
-                "/SC",
-                "ONSTART",
-                "/RU",
-                "SYSTEM",
-                "/RL",
-                "HIGHEST",
-                "/TR",
-                &task_command,
-                "/F",
-            ],
-        )
-        .map_err(|error| format!("failed to create the WakeMATE boot task: {error}"))
-    } else {
-        match run(
-            "schtasks.exe",
-            &["/Delete", "/TN", WINDOWS_BOOT_TASK_NAME, "/F"],
-        ) {
-            Ok(()) => Ok(()),
-            Err(error) if error.contains("ERROR: The system cannot find the file specified.") => {
-                Ok(())
-            }
-            Err(error) => Err(format!("failed to delete the WakeMATE boot task: {error}")),
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn scheduled_task_command(exe_path: &Path, config_path: &Path) -> String {
-    format!(
-        "\"{}\" --headless-server --config-path \"{}\"",
-        exe_path.display(),
-        config_path.display()
-    )
 }
 
 #[cfg(target_os = "windows")]

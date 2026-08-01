@@ -1,5 +1,9 @@
 param(
     [switch]$SkipPrereqCheck,
+    # Retained for compatibility with existing build commands. Ordinary
+    # installer builds now always rebuild the release executable so a stale
+    # target\release binary can never be packaged under a newer installer
+    # version.
     [switch]$BuildRelease
 )
 
@@ -38,17 +42,15 @@ if (-not (Test-Path -LiteralPath $issFile)) {
 }
 
 if (-not $SkipPrereqCheck) {
-    if ($BuildRelease -or -not (Test-Path -LiteralPath $releaseExe)) {
-        if (-not (Test-Path -LiteralPath $buildReleaseScript)) {
-            throw "Release binary not found at '$releaseExe', and build helper was not found at '$buildReleaseScript'."
-        }
+    if (-not (Test-Path -LiteralPath $buildReleaseScript)) {
+        throw "Release build helper was not found at '$buildReleaseScript'."
+    }
 
-        Write-Host "Building release binary:" $buildReleaseScript
-        & $buildReleaseScript
+    Write-Host "Building fresh release binary:" $buildReleaseScript
+    & $buildReleaseScript
 
-        if ($LASTEXITCODE -ne 0) {
-            throw "Release build failed with exit code $LASTEXITCODE."
-        }
+    if ($LASTEXITCODE -ne 0) {
+        throw "Release build failed with exit code $LASTEXITCODE."
     }
 
     if (-not (Test-Path -LiteralPath $releaseExe)) {

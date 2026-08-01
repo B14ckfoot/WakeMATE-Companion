@@ -22,9 +22,11 @@ This checklist is for shipping a public Windows download. It is not legal advice
 - Confirm no tokens, passwords, or personal data are written to logs.
 - Confirm the pairing token is stored via the OS credential store (`token_storage: "keyring"` after first run), with the file-based fallback only engaging (and logging a warning) when the credential store is genuinely unavailable.
 - Confirm the tray `Rotate Pairing Token` action works and persists the new token.
-- Confirm `/v1/pairing/activate` does **not** grant input/power capability without an explicit "Yes" on the native desktop confirmation dialog, and that it is refused outright from the pre-logon headless service.
+- Confirm `/v1/pairing/activate` does **not** grant input/power capability without an explicit "Yes" on the native desktop confirmation dialog.
+- Upgrade a machine that has the old `WakeMATE Companion Server` scheduled task and confirm Setup removes it. Verify a stale `--headless-server` launch exits without reading user state or binding HTTP/TLS.
+- Reboot to the Windows sign-in screen and confirm the phone can still send Wake-on-LAN directly, while Companion health/control correctly remains unavailable until sign-in; then sign in and confirm the normal-user tray owns HTTP/TLS, can show a pairing prompt, and accepts approved input.
 - Confirm repeated bad tokens against an authenticated endpoint trigger the per-IP lockout (429) within a few dozen requests.
-- Confirm the pairing QR carries `tls_port` and the exact lowercase SHA-256 leaf-certificate fingerprint, and that the fingerprint remains stable across companion restarts.
+- Confirm the pairing QR is contract-v3 structured JSON with `kind: "wakemate-pairing"`, carries a fresh one-time `token`, `tls_port`, and the exact lowercase SHA-256 leaf-certificate fingerprint, omits unknown `ip`/`mac` fields, and keeps the fingerprint stable across companion restarts.
 - Confirm the current Android and iOS mobile builds reject a changed/mismatched certificate before sending the token.
 - Confirm every supported phone has upgraded and re-scanned before setting `allow_insecure_http` to `false`; do not ship a wider-than-home-LAN release with the compatibility listener enabled.
 - Confirm "Reset Companion..." clears the stored token and local settings after its own confirmation dialog, and does not claim to affect any cloud account (it can't -- there isn't one).
@@ -37,11 +39,15 @@ This checklist is for shipping a public Windows download. It is not legal advice
 - Run `.\scripts\quality-check.ps1` (fmt, clippy `-D warnings`, tests, release build) and confirm it passes.
 - Build `.\build-release.ps1` or `cargo build --release` from a working Visual Studio Developer shell.
 - Verify the final binary path and SHA256 hash.
+- Upload the versioned Windows installer to the public download host, update
+  `WakeMate-Website/src/lib/site-config.ts` to that exact version, deploy the
+  website, and test the Companion button from a clean browser before shipping
+  the mobile build that links users there.
 - Bundle `installer\redist\VC_redist.x64.exe` if you keep using the MSVC Windows target.
 - Sign the `.exe` and installer with Authenticode.
 - Verify SmartScreen reputation behavior on a clean Windows machine.
 - Verify the installer creates Add/Remove Programs entries.
-- Verify uninstall removes installed files, shortcuts, the pre-logon scheduled task, and the startup Run-key entry cleanly; verify it leaves `%APPDATA%\WakeMATE Companion\` and the Credential Manager entry alone (see `docs/TROUBLESHOOTING.md`).
+- Verify uninstall removes installed files, shortcuts, the startup Run-key entry, and any retired pre-logon scheduled task cleanly; verify it leaves `%APPDATA%\WakeMATE Companion\` and the Credential Manager entry alone (see `docs/TROUBLESHOOTING.md`).
 - Verify updates do not overwrite user config unexpectedly.
 - macOS: see `docs/MACOS_BUILD.md` -- there is no signed/notarized artifact to gate on yet; do not ship an unsigned `.dmg` as a production release.
 

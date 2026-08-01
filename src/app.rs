@@ -36,9 +36,9 @@ pub struct AppState {
     pub rate_limiter: Arc<RateLimiter>,
     pub pairing: Arc<PairingCoordinator>,
     pub registry: SharedDeviceRegistry,
-    /// Set for the boot-time, pre-logon service instance. No interactive
-    /// desktop session exists to approve a pairing prompt or receive input
-    /// commands in that context, so both are refused regardless of config.
+    /// Defense-in-depth flag for a non-interactive server context. Windows no
+    /// longer starts such a server, but any future/headless host still lacks
+    /// a desktop session for approval or input, so both stay refused.
     pub headless: bool,
 }
 
@@ -161,8 +161,12 @@ async fn pairing_status(
         // pending while it sits in the enrollment slot, otherwise denied
         // (an explicit "No", an expired prompt, or a later revocation all
         // mean the same thing to the phone: not authorized, enroll again).
-        let registered = registry_snapshot(&state)?.contains(device_id);
-        if registered {
+        // Keep the registry guard until after checking the enrollment slot.
+        // Approval commits in the same registry -> enrollment order, so a
+        // concurrent status read sees either pending before registration or
+        // approved after it, never an absent/false-denied gap between them.
+        let registry = registry_snapshot(&state)?;
+        if registry.contains(device_id) {
             ApprovalState::Approved
         } else if state.pairing.enrollment_pending_for(device_id) {
             ApprovalState::Pending
@@ -201,7 +205,7 @@ async fn pairing_enroll(
     let config = config_snapshot(&state.config)?;
     // Enrollment specifically requires the shared QR token -- a per-device
     // token must not be able to mint further device tokens.
-    authenticate_shared_only(&state, peer, &headers, &config.api_token)?;
+    let credential = authenticate_shared_only(&state, peer, &headers, &config.api_token)?;
 
     if state.headless {
         return Err(AppError::forbidden(
@@ -222,12 +226,24 @@ async fn pairing_enroll(
     let device_id = pending.device_id.clone();
     let device_token = pending.token.clone();
 
-    match state.pairing.request(
-        PairingRequestInfo { peer: peer.ip() },
-        state.config.clone(),
-        state.registry.clone(),
-        Some(pending),
-    ) {
+    let request_info = PairingRequestInfo { peer: peer.ip() };
+    let outcome = match credential.pairing_session_token() {
+        Some(token) => state.pairing.request_with_session(
+            request_info,
+            state.config.clone(),
+            state.registry.clone(),
+            Some(pending),
+            Some(token),
+        ),
+        None => state.pairing.request(
+            request_info,
+            state.config.clone(),
+            state.registry.clone(),
+            Some(pending),
+        ),
+    };
+
+    match outcome {
         PairingOutcome::AwaitingApproval => Ok(Json(ApiResponse::ok(
             "waiting for approval on the desktop",
             EnrollResponse {
@@ -243,6 +259,9 @@ async fn pairing_enroll(
         PairingOutcome::Unavailable => Err(AppError::forbidden(
             "the WakeMATE tray app is not running, so pairing cannot be confirmed on this computer",
         )),
+        PairingOutcome::InvalidSession => Err(AppError::unauthorized(
+            "this pairing QR code has expired or was already used; show a new pairing QR code and scan it again",
+        )),
     }
 }
 
@@ -252,7 +271,7 @@ async fn pairing_activate(
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<PairingActivationResponse>>, AppError> {
     let config = config_snapshot(&state.config)?;
-    authenticate_pairing_activate(&state, peer, &headers, &config.api_token)?;
+    let credential = authenticate_pairing_activate(&state, peer, &headers, &config.api_token)?;
 
     if state.headless {
         return Err(AppError::forbidden(
@@ -261,12 +280,24 @@ async fn pairing_activate(
         ));
     }
 
-    match state.pairing.request(
-        PairingRequestInfo { peer: peer.ip() },
-        state.config.clone(),
-        state.registry.clone(),
-        None,
-    ) {
+    let request_info = PairingRequestInfo { peer: peer.ip() };
+    let outcome = match credential.pairing_session_token() {
+        Some(token) => state.pairing.request_with_session(
+            request_info,
+            state.config.clone(),
+            state.registry.clone(),
+            None,
+            Some(token),
+        ),
+        None => state.pairing.request(
+            request_info,
+            state.config.clone(),
+            state.registry.clone(),
+            None,
+        ),
+    };
+
+    match outcome {
         PairingOutcome::AwaitingApproval | PairingOutcome::Busy => Ok(Json(ApiResponse::ok(
             "waiting for approval on the desktop",
             PairingActivationResponse {
@@ -277,6 +308,9 @@ async fn pairing_activate(
         ))),
         PairingOutcome::Unavailable => Err(AppError::forbidden(
             "the WakeMATE tray app is not running, so pairing cannot be confirmed on this computer",
+        )),
+        PairingOutcome::InvalidSession => Err(AppError::unauthorized(
+            "this pairing QR code has expired or was already used; show a new pairing QR code and scan it again",
         )),
     }
 }
@@ -417,7 +451,7 @@ fn security_screen(
     );
 
     if state.headless {
-        // The pre-logon service instance has no interactive session, so there
+        // A non-interactive server has no desktop session, so there
         // is no desktop for a security screen to appear on.
         let result = SecurityCommandResult {
             status: SecurityCommandStatus::Unsupported,
@@ -505,8 +539,8 @@ fn apply_fallback(
 }
 
 /// How `authenticate_inner` treats the one-time pairing-session token (the
-/// credential embedded in the pairing QR code / Universal Link) in addition
-/// to the permanent shared `api_token`.
+/// credential embedded in the structured pairing QR code) in addition to the
+/// permanent shared `api_token`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SessionTokenMode {
     /// Not accepted at all (`/v1/wake`, `/v1/command`, `/v1/info`): the
@@ -516,10 +550,26 @@ enum SessionTokenMode {
     /// polls this repeatedly with the same token while waiting for desktop
     /// approval.
     ReadOnly,
-    /// Accepted and burned on success (`/v1/pairing/enroll`,
-    /// `/v1/pairing/activate`), so a leaked QR code or link cannot be
-    /// replayed to start unlimited pairing attempts.
-    Consume,
+    /// Accepted only while still claimable (`/v1/pairing/enroll`,
+    /// `/v1/pairing/activate`). The coordinator burns it later, at the exact
+    /// point a new desktop prompt is reserved, so Busy/Unavailable responses
+    /// do not destroy an otherwise retryable QR code.
+    Claimable,
+}
+
+enum AuthenticatedCredential {
+    Shared,
+    PairingSession(String),
+    Device,
+}
+
+impl AuthenticatedCredential {
+    fn pairing_session_token(&self) -> Option<&str> {
+        match self {
+            Self::PairingSession(token) => Some(token.as_str()),
+            Self::Shared | Self::Device => None,
+        }
+    }
 }
 
 /// Validates the pairing credential -- the shared QR token or any approved
@@ -531,7 +581,7 @@ fn authenticate(
     peer: SocketAddr,
     headers: &HeaderMap,
     expected_token: &str,
-) -> Result<(), AppError> {
+) -> Result<AuthenticatedCredential, AppError> {
     authenticate_inner(
         state,
         peer,
@@ -545,20 +595,21 @@ fn authenticate(
 /// Like `authenticate`, but only the shared QR token or a valid one-time
 /// pairing-session token is accepted -- never a per-device token, so an
 /// already-approved phone can never mint further device tokens for other
-/// phones. The session token is consumed on success.
+/// phones. Authentication only establishes that the session token is still
+/// claimable; the coordinator consumes it once a prompt can be shown.
 fn authenticate_shared_only(
     state: &AppState,
     peer: SocketAddr,
     headers: &HeaderMap,
     expected_token: &str,
-) -> Result<(), AppError> {
+) -> Result<AuthenticatedCredential, AppError> {
     authenticate_inner(
         state,
         peer,
         headers,
         expected_token,
         false,
-        SessionTokenMode::Consume,
+        SessionTokenMode::Claimable,
     )
 }
 
@@ -571,7 +622,7 @@ fn authenticate_pairing_status(
     peer: SocketAddr,
     headers: &HeaderMap,
     expected_token: &str,
-) -> Result<(), AppError> {
+) -> Result<AuthenticatedCredential, AppError> {
     authenticate_inner(
         state,
         peer,
@@ -584,20 +635,21 @@ fn authenticate_pairing_status(
 
 /// Used by `/v1/pairing/activate` (the legacy, non-per-device pairing
 /// flow): accepts the shared token, an approved device token, or the
-/// current pairing-session token, consuming the session token on success.
+/// current pairing-session token. A claimable session is consumed later only
+/// when the coordinator can reserve a new prompt.
 fn authenticate_pairing_activate(
     state: &AppState,
     peer: SocketAddr,
     headers: &HeaderMap,
     expected_token: &str,
-) -> Result<(), AppError> {
+) -> Result<AuthenticatedCredential, AppError> {
     authenticate_inner(
         state,
         peer,
         headers,
         expected_token,
         true,
-        SessionTokenMode::Consume,
+        SessionTokenMode::Claimable,
     )
 }
 
@@ -608,7 +660,7 @@ fn authenticate_inner(
     expected_token: &str,
     accept_device_tokens: bool,
     session_mode: SessionTokenMode,
-) -> Result<(), AppError> {
+) -> Result<AuthenticatedCredential, AppError> {
     if let Some(remaining) = state.rate_limiter.locked_out(peer.ip()) {
         return Err(AppError::too_many_requests(format!(
             "too many failed attempts; try again in {} seconds",
@@ -620,42 +672,45 @@ fn authenticate_inner(
         .get(AUTH_HEADER)
         .and_then(|value| value.to_str().ok());
 
-    let accepted = provided
-        .map(|provided| {
-            if tokens_match(provided, expected_token) {
-                return true;
-            }
-            match session_mode {
-                SessionTokenMode::None => {}
-                SessionTokenMode::ReadOnly => {
-                    if state.pairing.pairing_session_matches(provided) {
-                        return true;
-                    }
-                }
-                SessionTokenMode::Consume => {
-                    if state.pairing.consume_pairing_session_token(provided) {
-                        return true;
-                    }
+    let credential = provided.and_then(|provided| {
+        if tokens_match(provided, expected_token) {
+            return Some(AuthenticatedCredential::Shared);
+        }
+        match session_mode {
+            SessionTokenMode::None => {}
+            SessionTokenMode::ReadOnly => {
+                if state.pairing.pairing_session_matches(provided) {
+                    return Some(AuthenticatedCredential::PairingSession(
+                        provided.to_string(),
+                    ));
                 }
             }
-            if !accept_device_tokens {
-                return false;
+            SessionTokenMode::Claimable => {
+                if state.pairing.pairing_session_claimable(provided) {
+                    return Some(AuthenticatedCredential::PairingSession(
+                        provided.to_string(),
+                    ));
+                }
             }
-            state
-                .registry
-                .lock()
-                .map(|registry| registry.authenticate(provided).is_some())
-                .unwrap_or(false)
-        })
-        .unwrap_or(false);
+        }
+        if !accept_device_tokens {
+            return None;
+        }
+        state
+            .registry
+            .lock()
+            .ok()
+            .and_then(|registry| registry.authenticate(provided))
+            .map(|_| AuthenticatedCredential::Device)
+    });
 
-    if !accepted {
+    let Some(credential) = credential else {
         state.rate_limiter.record_failure(peer.ip());
         return Err(AppError::unauthorized("unauthorized"));
-    }
+    };
 
     state.rate_limiter.record_success(peer.ip());
-    Ok(())
+    Ok(credential)
 }
 
 fn registry_snapshot(
@@ -670,7 +725,7 @@ fn registry_snapshot(
 fn ensure_input_enabled(state: &AppState, config: &AppConfig) -> Result<(), AppError> {
     if state.headless {
         return Err(AppError::forbidden(
-            "input commands are not available from the pre-logon service",
+            "input commands are not available from a non-interactive server",
         ));
     }
 

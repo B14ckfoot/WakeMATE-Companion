@@ -18,7 +18,7 @@ WakeMATE Companion is the desktop counterpart to the [WakeMATE mobile app](../..
 
 1. Download **`WakeMATE Companion Setup.exe`** from the project's Releases page *(link placeholder — publish via the draft-release workflow, see Development below)*.
 2. Run the installer. **The installer is not yet code-signed**, so Windows SmartScreen may show "Windows protected your PC" — click **More info → Run anyway** only if you downloaded it from the official Releases page and, ideally, verified the published SHA-256 checksum. Never disable SmartScreen or your antivirus to install it.
-3. Approve the one-time administrator prompt. Admin rights are used **only during install/uninstall** (Program Files, the Microsoft VC++ runtime if missing, and a boot-time status service); the app itself runs as your normal user.
+3. Approve the one-time administrator prompt. Admin rights are used **only during install/uninstall** (Program Files, the Microsoft VC++ runtime if missing, Windows Firewall, and cleanup of legacy installer state); the app itself runs as your normal user. Start Setup normally rather than right-clicking **Run as administrator**, so it can prepare the correct Windows user profile after the UAC prompt.
 4. When the installer finishes, WakeMATE launches into the system tray automatically.
 
 On a fresh install the companion is pre-configured so your phone can discover it (`allow_remote_connections`, `allow_discovery`, and launch-at-startup are enabled). Remote input and power control stay **off** until you explicitly approve pairing on this desktop.
@@ -29,7 +29,7 @@ No terminal, runtime installation, config editing, or manual port setup is requi
 
 1. Make sure the phone and this PC are on the same Wi-Fi/LAN.
 2. Click the WakeMATE tray icon → **View Pairing QR Code**.
-3. In the WakeMATE mobile app, scan the QR code — either from **Add device → Scan QR** (saves the computer *and* pairs in one scan) or from **Settings** via the camera button next to the pairing-token field. The QR carries the device name, address, pairing token, HTTPS port, and certificate fingerprint (pairing contract v2). The phone pins that fingerprint before sending the token.
+3. In the WakeMATE mobile app, choose **Add device → Scan QR**. One scan saves the computer and starts secure pairing. The structured JSON QR carries the device name, address, fresh one-time pairing-session token, HTTPS port, and certificate fingerprint (pairing contract v3). The phone pins that fingerprint before sending the token.
 4. The mobile app saves the token and requests activation. A dialog appears **on this desktop**: *"A device at `<ip>` wants to pair…"*. Click **Yes** only if you just initiated pairing from your own phone. The phone polls the companion and shows the real outcome (approved, denied, or still waiting).
 5. Remote mouse/keyboard/media/power controls are now enabled for the paired phone.
 
@@ -37,7 +37,7 @@ No terminal, runtime installation, config editing, or manual port setup is requi
 
 - **Windows Firewall prompt** (first time LAN access is enabled): allows your phone to reach the companion on your **private** network. Allow it for private networks only; without it, the phone cannot connect, but the app still runs locally.
 - **Startup registration**: the tray app registers under your user's startup programs so it's available after login. Toggle it anytime via tray → **Launch on Windows Startup**.
-- **Boot-time status service**: the installer registers a background task so your phone can see the PC's online status *before* anyone signs in. This pre-logon service is locked down — it refuses pairing and all input commands unconditionally.
+- **Wake before sign-in**: the phone sends Wake-on-LAN magic packets directly to the saved network address, so waking does not require a privileged Companion service. Companion status, pairing, and remote control become available after Windows signs in and starts the normal-user tray app.
 - Nothing else: no microphone, camera, Bluetooth, or location access is used or requested.
 
 ### Everyday use
@@ -58,7 +58,7 @@ There is **no automatic update yet**. To update, download the newer installer an
 
 ### Uninstalling
 
-Use Windows **Settings → Apps → WakeMATE Companion → Uninstall**. This removes the app, the boot-time service, and the startup registration. Your config folder (`%APPDATA%\WakeMATE Companion`), TLS identity, and pairing token stored in Windows Credential Manager are currently left behind; use tray → **Reset Companion…** *before* uninstalling to clear pairing settings, then remove the app-data folder if you also want the retained TLS identity deleted.
+Use Windows **Settings → Apps → WakeMATE Companion → Uninstall**. This removes the app, the startup registration, and any retired boot task left by an older release. Your config folder (`%APPDATA%\WakeMATE Companion`), TLS identity, and pairing token stored in Windows Credential Manager are currently left behind; use tray → **Reset Companion…** *before* uninstalling to clear pairing settings, then remove the app-data folder if you also want the retained TLS identity deleted.
 
 ### Troubleshooting
 
@@ -75,7 +75,7 @@ See [docs/TROUBLESHOOTING.md](./docs/TROUBLESHOOTING.md). Quick checks: both dev
 - Input and power commands are off by default and require both a config flag **and** the one-time desktop approval dialog.
 - The pairing token lives in the **Windows Credential Manager**, not in a plaintext file (older plaintext tokens are migrated automatically; the config file's `api_token` field then reads as empty — this is intentional).
 - Token comparison is constant-time; repeated bad tokens trigger a per-IP lockout; a single-instance lock prevents duplicate copies.
-- The pre-logon boot service refuses pairing activation and all input commands unconditionally.
+- No Companion API runs as SYSTEM before sign-in. Offline waking remains a direct phone-to-network Wake-on-LAN operation; authenticated Companion status/control starts with the normal-user tray app.
 - Full threat model: [docs/SECURITY_MODEL.md](./docs/SECURITY_MODEL.md).
 
 ## Known Limitations
@@ -101,14 +101,14 @@ Everything below is for building from source; end users never need it.
 WakeMATE has two behaviors:
 
 1. **Offline wake path** — send a Wake-on-LAN magic packet to a saved MAC address; works while the target PC sleeps (handled by the network adapter, not the app).
-2. **Online control path** — once awake and paired, the companion accepts authenticated pinned-HTTPS commands for status, wake relay, input, media, and power. On Windows, a headless boot task (`schtasks /RU SYSTEM`, required by Task Scheduler for pre-logon triggers) answers `/v1/health` and `/v1/info` before sign-in, while the tray app starts at logon. Plain HTTP is a temporary compatibility listener controlled by `allow_insecure_http`.
+2. **Online control path** — once awake, signed in, and paired, the normal-user tray companion accepts authenticated pinned-HTTPS commands for status, wake relay, input, media, and power. No privileged Companion listener runs before sign-in. Plain HTTP is a temporary compatibility listener controlled by `allow_insecure_http`.
 
 ### API summary
 
 Public: `GET /`, `GET /v1/health` (includes `protocol_version`, currently `4`).
 Authenticated (`x-wakemate-token` header; per-IP rate-limited): `GET /v1/info`, `GET /v1/pairing/check`, `GET /v1/pairing/status` (returns `approval: idle|pending|approved|denied` plus the capability flags, so the phone can poll for the desktop's Yes/No), `POST /v1/pairing/activate` (returns `pending_approval`; grant happens only via the desktop dialog), `POST /v1/wake`, `POST /v1/command`.
 Discovery: UDP port `41234`, probe string `wakemate:discover`, JSON reply with device name, IP, MAC, legacy API port, TLS port, TLS fingerprint, version, and `protocol_version`; only active when remote access **and** discovery are both enabled. Discovery metadata is informational; the phone only trusts a fingerprint obtained through the visual QR channel.
-Pairing QR (contract v2): JSON `{"v":2,"kind":"wakemate-pairing","name":...,"ip":...,"api_port":...,"tls_port":...,"fp":...,"mac":...,"token":...,"protocol_version":2}`; `ip`/`mac` are omitted when the network can't be detected. `fp` is the lowercase SHA-256 digest of the leaf certificate's DER bytes.
+Pairing QR (contract v3): local structured JSON `{"v":3,"kind":"wakemate-pairing","name":...,"ip":...,"api_port":...,"tls_port":...,"fp":...,"mac":...,"token":...,"protocol_version":4}`; `ip`/`mac` are omitted when the network can't be detected. `token` is normally a fresh, single-use pairing-session credential with a 10-minute lifetime, and `fp` is the lowercase SHA-256 digest of the leaf certificate's DER bytes. The QR carries the pairing data directly and does not require a web redirect.
 
 Command payload examples (all `POST /v1/command`, snake_case tagged):
 
@@ -198,7 +198,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build-release.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\build-installer.ps1
 ```
 
-The installer prepares a clean-install config with `allow_remote_connections`, `allow_discovery`, and `launch_on_startup` enabled (existing configs are left alone on upgrade) and registers the pre-logon boot task. Code signing is prepared but disabled in [installer/wakemate-companion.iss](./installer/wakemate-companion.iss) until a certificate exists.
+The installer prepares a clean-install config with `allow_remote_connections`, `allow_discovery`, and `launch_on_startup` enabled (existing configs are left alone on upgrade) under the original interactive user's profile. It also removes the retired pre-logon SYSTEM task from older releases. Code signing is prepared but disabled in [installer/wakemate-companion.iss](./installer/wakemate-companion.iss) until a certificate exists.
 
 Tray icons: `assets/tray-icon.ico` / `assets/tray-icon.png`, with a built-in brand-colored fallback ([src/theme.rs](./src/theme.rs)).
 

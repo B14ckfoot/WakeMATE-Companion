@@ -1,5 +1,5 @@
 #define MyAppName "WakeMATE Companion"
-#define MyAppVersion "0.2.2"
+#define MyAppVersion "0.2.3"
 #define MyAppPublisher "Marco Macias"
 #define MyAppURL "https://wakematemobile.com"
 #define MyAppExeName "wakemate-companion.exe"
@@ -58,16 +58,16 @@ Name: "{autodesktop}\WakeMATE Companion"; Filename: "{app}\{#MyAppExeName}"; Ico
 
 [Run]
 Filename: "{tmp}\{#MyVCRedistExe}"; Parameters: "/install /quiet /norestart"; StatusMsg: "Installing Microsoft Visual C++ Runtime..."; Flags: waituntilterminated runhidden skipifdoesntexist; Check: NeedsVCRedist
-; Runs on every install (not just the first) so reinstalling repairs a
-; corrupted or reset config: pairing must only ever need a QR scan.
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--prepare-install-config"; StatusMsg: "Preparing WakeMATE pairing settings..."; Flags: waituntilterminated runhidden
-; A program-scoped rule on every profile: home networks are usually Private,
-; so relying on Windows' one-time consent popup (which many people dismiss,
-; and which only covers the profile active at the time) leaves the phone
-; unable to reach the companion.
+; Runs on every install (not just the first) as the original interactive user
+; so config, Credential Manager, and HKCU startup state never land in an
+; over-the-shoulder administrator account.
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--prepare-install-config"; StatusMsg: "Preparing WakeMATE pairing settings..."; Flags: waituntilterminated runhidden runasoriginaluser
+; A program-scoped Private-profile rule lets trusted home LAN devices reach
+; the Companion without exposing it when Windows classifies the network as
+; Public. The rule covers both API listeners and UDP discovery for this exe.
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""WakeMATE Companion"""; StatusMsg: "Configuring Windows Firewall..."; Flags: waituntilterminated runhidden
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""WakeMATE Companion"" dir=in action=allow program=""{app}\{#MyAppExeName}"" profile=any enable=yes"; StatusMsg: "Configuring Windows Firewall..."; Flags: waituntilterminated runhidden
-Filename: "{app}\{#MyAppExeName}"; Description: "Launch WakeMATE Companion"; Flags: nowait postinstall skipifsilent
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""WakeMATE Companion"" dir=in action=allow program=""{app}\{#MyAppExeName}"" profile=private enable=yes"; StatusMsg: "Configuring Windows Firewall..."; Flags: waituntilterminated runhidden
+Filename: "{app}\{#MyAppExeName}"; Description: "Launch WakeMATE Companion"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallRun]
 Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""WakeMATE Companion Server"" /F"; Flags: runhidden skipifdoesntexist; RunOnceId: "RemoveBootTask"
@@ -81,6 +81,56 @@ FinishedHeadingLabel=WakeMATE is ready to rise and connect
 FinishedLabel=[name] is installed on your computer. No snooze button required -- open the WakeMATE app on your phone and scan the pairing QR code from the tray icon to finish connecting.
 
 [Code]
+function RemoveLegacyBootTask(): String;
+var
+  QueryExitCode: Integer;
+  DeleteExitCode: Integer;
+begin
+  Result := '';
+
+  { Releases before 0.2.3 registered a SYSTEM/ONSTART server. Its user-scoped
+    credentials, TLS identity, and device registry resolved under the SYSTEM
+    profile, and it retained the tray's listeners after logon. Query first so
+    a clean install with no legacy task is a normal, non-error path. }
+  if not Exec(
+    ExpandConstant('{sys}\schtasks.exe'),
+    '/Query /TN "WakeMATE Companion Server"',
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    QueryExitCode
+  ) then
+  begin
+    Result := 'Setup could not inspect the legacy WakeMATE background task.';
+  end
+  else if QueryExitCode = 0 then
+  begin
+    if not Exec(
+      ExpandConstant('{sys}\schtasks.exe'),
+      '/Delete /TN "WakeMATE Companion Server" /F',
+      '',
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      DeleteExitCode
+    ) then
+    begin
+      Result := 'Setup could not start removal of the legacy WakeMATE background task.';
+    end
+    else if DeleteExitCode <> 0 then
+    begin
+      Result := 'Setup could not remove the legacy WakeMATE background task.';
+    end
+    else
+    begin
+      Log('Removed legacy WakeMATE Companion Server scheduled task.');
+    end;
+  end
+  else
+  begin
+    Log('Legacy WakeMATE Companion Server scheduled task is not installed.');
+  end;
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ExitCode: Integer;
@@ -108,6 +158,7 @@ begin
   else
   begin
     Sleep(500);
+    Result := RemoveLegacyBootTask();
   end;
 end;
 

@@ -25,7 +25,7 @@ Wait 60 seconds, fix the token, and try again. There is no way to clear the lock
 This is a known, intentional consequence of the pairing-confirmation hardening (see `docs/SECURITY_MODEL.md`): `/v1/pairing/activate` responds immediately (so the phone doesn't hit its own request timeout) with `status: "pending_approval"`, but `allow_input_commands`/`allow_power_commands` only actually flip to `true` after someone clicks "Yes" on the native desktop confirmation dialog. If that dialog never appeared:
 
 - Confirm the WakeMATE tray app is actually running on the target desktop (not just installed). No dialog is possible without it.
-- Confirm you're not hitting the pre-logon headless service instead of the tray-hosted server -- the headless instance refuses pairing activation outright with a distinct error message ("no one is signed in on this computer right now...").
+- Confirm Windows is signed in. Current builds intentionally run Companion networking only in the normal-user tray process; Wake-on-LAN can still be sent directly by the phone before sign-in, but pairing and remote control require the tray.
 - Check for a dialog that appeared behind another window; it's always-on-top and foreground-activated, but alt-tab if you don't see it.
 
 ## "Windows Credential Manager" / token storage questions
@@ -36,11 +36,11 @@ This is a known, intentional consequence of the pairing-confirmation hardening (
 
 ## Port already in use / server won't start
 
-WakeMATE binds `7777` by default (configurable via `bind_address`). If another process holds that port, the HTTP listener will fail to bind and the tray icon will show an error state. The tray app also detects if *another WakeMATE instance* already has the port open and simply reuses it rather than erroring (see `server_is_reachable` in `src/tray.rs`) -- combined with the single-instance lock, a second launch of WakeMATE should exit quietly rather than fight over the port.
+WakeMATE binds `7777` by default (configurable via `bind_address`) and HTTPS on `7778` by default. If another process holds an enabled listener port, the tray reports a server error instead of silently treating that process as WakeMATE. Close the conflicting process or change the configured port, then restart WakeMATE. The single-instance lock makes a second tray launch exit quietly.
 
 ## Uninstalling and removing local data
 
-The Windows uninstaller removes the installed program files, Start Menu shortcuts, the pre-logon scheduled task, and the startup Run-key registration. It deliberately does **not** delete `%APPDATA%\WakeMATE Companion\` or the Windows Credential Manager entry, so a reinstall doesn't force re-pairing.
+The Windows uninstaller removes the installed program files, Start Menu shortcuts, the startup Run-key registration, and any retired pre-logon task left by an older release. It deliberately does **not** delete `%APPDATA%\WakeMATE Companion\` or the Windows Credential Manager entry, so a reinstall doesn't force re-pairing.
 
 To fully wipe local WakeMATE data (no cloud account is affected either way):
 

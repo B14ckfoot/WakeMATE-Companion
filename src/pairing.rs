@@ -20,8 +20,8 @@ const PROMPT_COOLDOWN: Duration = Duration::from_secs(10);
 const ENROLLMENT_TTL: Duration = Duration::from_secs(120);
 
 /// How long a one-time pairing-session token (the credential embedded in the
-/// pairing QR code / Universal Link, as opposed to the permanent shared
-/// `api_token`) stays claimable after being minted.
+/// structured pairing QR code, as opposed to the permanent shared `api_token`)
+/// stays claimable after being minted.
 const PAIRING_SESSION_TTL: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, Copy)]
@@ -40,9 +40,12 @@ pub enum PairingOutcome {
     /// device.
     Busy,
     /// No desktop confirmation surface is available in this run mode (for
-    /// example the pre-logon headless service, which has no interactive
-    /// session to prompt). Pairing must be completed from the tray app.
+    /// example the macOS headless developer preview). Pairing must be
+    /// completed from an interactive tray app.
     Unavailable,
+    /// The one-time QR credential was replaced, expired, or consumed between
+    /// authentication and reserving a new desktop prompt. No prompt was shown.
+    InvalidSession,
 }
 
 /// A device that has requested enrollment and is waiting for the person at
@@ -107,6 +110,25 @@ impl EnrollmentSlot {
         }
     }
 
+    /// Commits a valid enrollment without an observable gap where it is in
+    /// neither the pending slot nor the paired-device registry. Status reads
+    /// hold the registry lock through their enrollment check, so they see
+    /// either pending (before registration) or approved (after it), never a
+    /// false denial between.
+    pub fn commit_valid(&self, registry: &SharedDeviceRegistry) -> Option<PendingEnrollment> {
+        let pending = {
+            let guard = self.lock();
+            guard.as_ref().filter(|pending| !pending.expired()).cloned()
+        }?;
+
+        registry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .register_with_id(&pending.device_id, &pending.device_name, &pending.token);
+        self.clear();
+        Some(pending)
+    }
+
     /// Device name for the desktop prompt, if an enrollment is waiting.
     pub fn pending_device_name(&self) -> Option<String> {
         let guard = self.lock();
@@ -127,14 +149,13 @@ impl EnrollmentSlot {
     }
 }
 
-/// A one-time credential embedded in the pairing QR code / Universal Link
-/// instead of the permanent shared `api_token`, so a photo of the QR code or
-/// a leaked pairing link cannot be replayed indefinitely to enroll new
-/// devices. Read-only checks (`matches`, used by `/v1/pairing/status`) never
-/// expire it early; only a state-changing pairing action (`try_consume`,
-/// used by `/v1/pairing/enroll` and `/v1/pairing/activate`) burns it, so a
-/// phone can still poll for approval after the token that started the
-/// enrollment has already been consumed.
+/// A one-time credential embedded in the structured pairing QR code instead
+/// of the permanent shared `api_token`, so a photo of the QR code cannot be
+/// replayed indefinitely to enroll new devices. Read-only checks (`matches`,
+/// used by `/v1/pairing/status`) never expire it early; only a state-changing
+/// pairing action (`try_consume`, used by `/v1/pairing/enroll` and
+/// `/v1/pairing/activate`) burns it, so a phone can still poll for approval
+/// after the token that started the enrollment has already been consumed.
 struct PairingSession {
     token: String,
     minted_at: Instant,
@@ -182,6 +203,18 @@ impl PairingSessionSlot {
         guard
             .as_ref()
             .filter(|session| !session.expired())
+            .map(|session| crate::security::tokens_match(candidate, &session.token))
+            .unwrap_or(false)
+    }
+
+    /// Non-consuming preflight for a state-changing pairing request. Unlike
+    /// `matches`, a token that already started a prompt is no longer
+    /// claimable. The actual burn remains atomic in `try_consume`.
+    pub fn claimable(&self, candidate: &str) -> bool {
+        let guard = self.lock();
+        guard
+            .as_ref()
+            .filter(|session| !session.consumed && !session.expired())
             .map(|session| crate::security::tokens_match(candidate, &session.token))
             .unwrap_or(false)
     }
@@ -300,8 +333,8 @@ impl PairingCoordinator {
     }
 
     /// Mints a fresh one-time pairing-session token for a newly displayed QR
-    /// code / Universal Link, replacing whatever token (if any) was minted
-    /// for a previous QR display.
+    /// code, replacing whatever token (if any) was minted for a previous QR
+    /// display.
     pub fn mint_pairing_session_token(&self) -> String {
         self.session.mint()
     }
@@ -312,14 +345,21 @@ impl PairingCoordinator {
         self.session.matches(candidate)
     }
 
+    /// Non-consuming check used while authenticating a state-changing
+    /// pairing request. Consumption is deferred until `request_with_session`
+    /// has established that a new desktop prompt can actually be shown.
+    pub fn pairing_session_claimable(&self, candidate: &str) -> bool {
+        self.session.claimable(candidate)
+    }
+
     /// Consumes the current pairing-session token for a state-changing
     /// pairing action. See [`PairingSessionSlot::try_consume`].
     pub fn consume_pairing_session_token(&self, candidate: &str) -> bool {
         self.session.try_consume(candidate)
     }
 
-    /// No desktop UI is available to confirm pairing (headless / pre-logon
-    /// service mode, or a platform build without a tray yet).
+    /// No desktop UI is available to confirm pairing (for example, a platform
+    /// build without a tray yet).
     pub fn unavailable() -> Self {
         Self::new(None)
     }
@@ -345,9 +385,35 @@ impl PairingCoordinator {
         registry: SharedDeviceRegistry,
         pending: Option<PendingEnrollment>,
     ) -> PairingOutcome {
+        self.request_with_session(info, config, registry, pending, None)
+    }
+
+    /// Like `request`, but atomically burns a one-time QR credential only
+    /// after availability and prompt-cooldown checks pass. A Busy or
+    /// Unavailable response therefore remains retryable with the same QR.
+    pub fn request_with_session(
+        &self,
+        info: PairingRequestInfo,
+        config: SharedConfig,
+        registry: SharedDeviceRegistry,
+        pending: Option<PendingEnrollment>,
+        pairing_session_token: Option<&str>,
+    ) -> PairingOutcome {
         let Some(notifier) = self.notifier.clone() else {
             return PairingOutcome::Unavailable;
         };
+
+        // A desktop dialog can outlive the notification-spam cooldown. Never
+        // replace its shared enrollment slot while it is unanswered: the old
+        // dialog's Yes callback would otherwise register a newer device that
+        // the user was never shown.
+        if self.status.get() == ApprovalState::Pending {
+            return if pending.is_some() {
+                PairingOutcome::Busy
+            } else {
+                PairingOutcome::AwaitingApproval
+            };
+        }
 
         let mut last_prompt_at = self
             .last_prompt_at
@@ -365,6 +431,13 @@ impl PairingCoordinator {
             } else {
                 PairingOutcome::AwaitingApproval
             };
+        }
+
+        if pairing_session_token
+            .map(|token| !self.session.try_consume(token))
+            .unwrap_or(false)
+        {
+            return PairingOutcome::InvalidSession;
         }
 
         *last_prompt_at = Some(now);
@@ -515,6 +588,90 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_request_does_not_consume_pairing_session() {
+        let coordinator = PairingCoordinator::unavailable();
+        let token = coordinator.mint_pairing_session_token();
+
+        let outcome = coordinator.request_with_session(
+            request_info(),
+            shared_config(),
+            shared_registry(),
+            Some(PendingEnrollment::new("Test Phone".to_string())),
+            Some(&token),
+        );
+
+        assert_eq!(outcome, PairingOutcome::Unavailable);
+        assert!(coordinator.pairing_session_claimable(&token));
+    }
+
+    #[test]
+    fn busy_request_keeps_session_claimable_until_prompt_finishes() {
+        let coordinator = PairingCoordinator::new(Some(Arc::new(|_context: NotifierContext| {
+            // Keep the prompt pending.
+        })));
+
+        let first_pending = PendingEnrollment::new("Phone A".to_string());
+        let first_device_id = first_pending.device_id.clone();
+        let first = coordinator.request(
+            request_info(),
+            shared_config(),
+            shared_registry(),
+            Some(first_pending),
+        );
+        assert_eq!(first, PairingOutcome::AwaitingApproval);
+
+        let token = coordinator.mint_pairing_session_token();
+        let busy_pending = PendingEnrollment::new("Phone B".to_string());
+        let busy_device_id = busy_pending.device_id.clone();
+        let busy = coordinator.request_with_session(
+            request_info(),
+            shared_config(),
+            shared_registry(),
+            Some(busy_pending),
+            Some(&token),
+        );
+        assert_eq!(busy, PairingOutcome::Busy);
+        assert!(coordinator.pairing_session_claimable(&token));
+        assert!(coordinator.enrollment_pending_for(&first_device_id));
+        assert!(!coordinator.enrollment_pending_for(&busy_device_id));
+
+        *coordinator
+            .last_prompt_at
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(
+            Instant::now()
+                .checked_sub(PROMPT_COOLDOWN + Duration::from_secs(1))
+                .unwrap(),
+        );
+
+        let still_busy = coordinator.request_with_session(
+            request_info(),
+            shared_config(),
+            shared_registry(),
+            Some(PendingEnrollment::new("Phone B".to_string())),
+            Some(&token),
+        );
+        assert_eq!(still_busy, PairingOutcome::Busy);
+        assert!(coordinator.pairing_session_claimable(&token));
+        assert!(coordinator.enrollment_pending_for(&first_device_id));
+
+        // Once the first prompt has a definite answer, the same QR session
+        // can retry and is consumed exactly when its own prompt is shown.
+        coordinator.status.record_outcome(false);
+        coordinator.enrollment.clear();
+
+        let retry = coordinator.request_with_session(
+            request_info(),
+            shared_config(),
+            shared_registry(),
+            Some(PendingEnrollment::new("Phone B".to_string())),
+            Some(&token),
+        );
+        assert_eq!(retry, PairingOutcome::AwaitingApproval);
+        assert!(!coordinator.pairing_session_claimable(&token));
+    }
+
+    #[test]
     fn expired_enrollment_cannot_be_taken() {
         let slot = EnrollmentSlot::default();
         let mut pending = PendingEnrollment::new("Old Phone".to_string());
@@ -526,6 +683,23 @@ mod tests {
 
         assert!(!slot.holds(&device_id));
         assert!(slot.take_valid().is_none());
+    }
+
+    #[test]
+    fn committing_enrollment_never_exposes_a_denied_gap() {
+        let slot = EnrollmentSlot::default();
+        let registry = shared_registry();
+        let pending = PendingEnrollment::new("Test Phone".to_string());
+        let device_id = pending.device_id.clone();
+        slot.set(pending);
+
+        assert!(slot.holds(&device_id));
+        assert!(!registry.lock().unwrap().contains(&device_id));
+
+        let committed = slot.commit_valid(&registry).expect("valid enrollment");
+        assert_eq!(committed.device_id, device_id);
+        assert!(registry.lock().unwrap().contains(&device_id));
+        assert!(!slot.holds(&device_id));
     }
 
     #[test]

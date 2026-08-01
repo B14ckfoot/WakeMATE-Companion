@@ -88,8 +88,8 @@ impl TlsIdentity {
 
         match write_result {
             Ok(()) => Ok(generated),
-            // A tray instance and the pre-logon server can start at nearly
-            // the same time. If the other process won the race, use its
+            // Two app processes can start at nearly the same time. If the
+            // other process won the race, use its
             // identity so both listeners advertise the same stable pin.
             Err(_) if path.exists() => {
                 let _ = fs::remove_file(&temp_path);

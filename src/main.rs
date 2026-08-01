@@ -8,6 +8,7 @@ mod discovery;
 mod error;
 mod input;
 mod pairing;
+mod pairing_qr;
 mod secure_attention;
 mod security;
 mod system;
@@ -49,22 +50,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tls::install_crypto_provider();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.iter().any(|arg| arg == HEADLESS_SERVER_ARG) {
+        // Versions before 0.2.3 installed an ONSTART task under SYSTEM. Its
+        // credential store, TLS identity, and paired-device registry were a
+        // different security principal's state, and the process retained the
+        // tray's ports after logon. Keep accepting the legacy argument only
+        // to retire stale tasks safely; never touch user state or bind a
+        // server in that context.
+        warn!(
+            "WakeMATE pre-logon server mode is disabled; direct phone Wake-on-LAN remains available"
+        );
+        return Ok(());
+    }
+
     let config_path = config_path_from_args(&args)?.unwrap_or(AppConfig::path()?);
 
     if args.iter().any(|arg| arg == PREPARE_INSTALL_CONFIG_ARG) {
         let config = AppConfig::prepare_install_config_at_path(&config_path)?;
         if let Err(error) = system::sync_launch_on_startup(config.launch_on_startup) {
             warn!(%error, "failed to sync the Windows startup preference during install prep");
-        }
-        #[cfg(target_os = "windows")]
-        if let Err(error) =
-            system::sync_prelogon_server_task(config.launch_on_startup, &config_path)
-        {
-            warn!(
-                %error,
-                path = %config_path.display(),
-                "failed to sync the pre-logon WakeMATE server task during install prep"
-            );
         }
         info!(
             path = %config_path.display(),
@@ -76,10 +81,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "WakeMATE install config prepared"
         );
         return Ok(());
-    }
-
-    if args.iter().any(|arg| arg == HEADLESS_SERVER_ARG) {
-        return run_headless_server(config_path);
     }
 
     let config = Arc::new(Mutex::new(AppConfig::load_or_create_from_path(
@@ -308,41 +309,4 @@ fn config_path_from_args(
     }
 
     Ok(None)
-}
-
-fn run_headless_server(config_path: std::path::PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let config = Arc::new(Mutex::new(AppConfig::load_or_create_from_path(
-        &config_path,
-    )?));
-    let snapshot = config_snapshot(&config)?;
-
-    info!(
-        path = %config_path.display(),
-        bind = %snapshot.effective_bind_address(),
-        discovery_port = snapshot.discovery_port,
-        remote_access = snapshot.allow_remote_connections,
-        discovery_enabled = snapshot.discovery_enabled(),
-        device_name = %snapshot.device_name,
-        "WakeMATE headless server starting"
-    );
-
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-
-    // The pre-logon service runs with no interactive desktop session, so
-    // there is nobody who could approve a pairing prompt or receive
-    // injected input; both are refused unconditionally (see AppState).
-    // Already-approved per-device tokens still authenticate here so a
-    // paired phone can check status and send wake packets before sign-in.
-    let pairing = Arc::new(PairingCoordinator::unavailable());
-    let registry: SharedDeviceRegistry = Arc::new(Mutex::new(DeviceRegistry::load_or_default()));
-    runtime.block_on(run_server(
-        config,
-        pairing,
-        registry,
-        true,
-        std::future::pending::<()>(),
-    ))?;
-    Ok(())
 }

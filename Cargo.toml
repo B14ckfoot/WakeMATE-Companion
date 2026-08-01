@@ -1,6 +1,6 @@
 [package]
 name = "wakemate-companion"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "WakeMATE desktop companion for device discovery, Wake-on-LAN, and remote input control"
 
@@ -23,7 +23,6 @@ subtle = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]

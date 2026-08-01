@@ -33,7 +33,7 @@ use crate::{
     config::{AppConfig, SharedConfig},
     devices::{DeviceRegistry, PairedDevice, SharedDeviceRegistry},
     pairing::{NotifierContext, PairingCoordinator},
-    run_server, system, theme,
+    pairing_qr, run_server, system, theme,
     tls::TlsIdentity,
 };
 
@@ -96,19 +96,7 @@ impl TrayApp {
         registry: SharedDeviceRegistry,
         assets_dir: PathBuf,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let snapshot = config_snapshot(&config)?;
-        let existing_listener = system::server_is_reachable(&snapshot.effective_bind_address())
-            || system::server_is_reachable(&snapshot.effective_tls_bind_address());
-        let server = if existing_listener {
-            info!(
-                http_bind = %snapshot.effective_bind_address(),
-                tls_bind = %snapshot.effective_tls_bind_address(),
-                "WakeMATE detected an existing server listener and will reuse it"
-            );
-            ServerThread::inactive()
-        } else {
-            ServerThread::spawn(config.clone(), registry.clone())?
-        };
+        let server = ServerThread::spawn(config.clone(), registry.clone())?;
 
         Ok(Self {
             config: config.clone(),
@@ -260,9 +248,7 @@ impl TrayApp {
             return format!("{} — Error: {error}", config.device_name);
         }
 
-        let state = if !self.server.active
-            && !system::server_is_reachable(&config.effective_bind_address())
-        {
+        let state = if !self.server.active {
             "Server not running"
         } else if !config.allow_remote_connections {
             "Local only — not discoverable"
@@ -558,6 +544,16 @@ impl TrayApp {
 
         self.server.finish()
     }
+
+    fn refresh_server_health(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(error) = self.server.take_unexpected_failure() else {
+            return Ok(());
+        };
+
+        error!(%error, "WakeMATE server stopped unexpectedly");
+        self.startup_error = Some(error);
+        self.refresh_tray_state()
+    }
 }
 
 impl ApplicationHandler<UserEvent> for TrayApp {
@@ -622,6 +618,9 @@ impl ApplicationHandler<UserEvent> for TrayApp {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
         if now >= self.next_config_poll {
+            if let Err(error) = self.refresh_server_health() {
+                error!(error = %error, "failed to refresh WakeMATE server health");
+            }
             if let Err(error) = self.reload_config_if_changed() {
                 error!(error = %error, "failed to reload config changes from disk");
             }
@@ -697,6 +696,9 @@ impl PairingPopup {
         owner_window: isize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let snapshot = config_snapshot(config)?;
+        let pairing = pairing.ok_or_else(|| {
+            io::Error::other("WakeMATE server is not running; pairing QR is unavailable")
+        })?;
         let mut attributes = Window::default_attributes()
             .with_title("WakeMATE Pairing")
             .with_active(true)
@@ -733,22 +735,10 @@ impl PairingPopup {
         // Prefer a fresh one-time pairing-session token minted from the
         // coordinator actually serving this process's HTTP requests, so the
         // QR code's credential is short-lived and single-use (see
-        // pairing.rs `PairingSessionSlot`). Falls back to the permanent
-        // shared token only when no local coordinator is available (the
-        // tray is reusing another process's already-running listener) --
-        // a session token minted here would not be recognized by whichever
-        // process is actually answering requests.
-        let qr_token = match pairing {
-            Some(pairing) => pairing.mint_pairing_session_token(),
-            None => {
-                warn!(
-                    "WakeMATE pairing QR is using the long-lived shared token because no local \
-                     pairing coordinator is available (this process is reusing another \
-                     process's server listener)"
-                );
-                snapshot.api_token.clone()
-            }
-        };
+        // pairing.rs `PairingSessionSlot`). If the server stopped, refuse to
+        // show a QR instead of exposing the long-lived shared token in a code
+        // that no active local coordinator could approve.
+        let qr_token = pairing.mint_pairing_session_token();
         let qr_payload = pairing_qr_payload(
             &qr_token,
             &snapshot.device_name,
@@ -1420,24 +1410,12 @@ struct ServerThread {
     join_handle: Option<thread::JoinHandle<Result<(), String>>>,
     /// The pairing coordinator this thread's server was constructed with, so
     /// the tray can mint pairing-session tokens that the *same* running
-    /// server instance will actually recognize. `None` when this
-    /// `ServerThread` is inactive (the tray detected and is reusing an
-    /// already-running listener from another process) -- there is no local
-    /// coordinator to share in that case, so the QR falls back to the
-    /// permanent shared token instead of minting an unrecognizable one.
+    /// server instance will actually recognize. Set to `None` after that
+    /// server stops so the tray refuses to display an unusable pairing QR.
     pairing: Option<Arc<PairingCoordinator>>,
 }
 
 impl ServerThread {
-    fn inactive() -> Self {
-        Self {
-            active: false,
-            shutdown_tx: None,
-            join_handle: None,
-            pairing: None,
-        }
-    }
-
     fn spawn(
         config: SharedConfig,
         registry: SharedDeviceRegistry,
@@ -1486,12 +1464,38 @@ impl ServerThread {
         config: SharedConfig,
         registry: SharedDeviceRegistry,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if !self.active {
-            return Ok(());
+        if self.active {
+            if let Err(error) = self.finish() {
+                warn!(%error, "previous WakeMATE server stopped with an error before restart");
+            }
         }
-        self.finish()?;
         *self = Self::spawn(config, registry)?;
         Ok(())
+    }
+
+    /// Collects a server thread that ended without a tray shutdown request.
+    /// This turns bind failures and other listener exits into an explicit tray
+    /// error instead of silently treating an arbitrary TCP service as the
+    /// WakeMATE server.
+    fn take_unexpected_failure(&mut self) -> Option<String> {
+        let finished = self
+            .join_handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished());
+        if !self.active || !finished {
+            return None;
+        }
+
+        self.active = false;
+        self.shutdown_tx.take();
+        self.pairing = None;
+
+        let result = match self.join_handle.take()?.join() {
+            Ok(Ok(())) => "WakeMATE server stopped unexpectedly".to_string(),
+            Ok(Err(error)) => error,
+            Err(_) => "WakeMATE server thread panicked".to_string(),
+        };
+        Some(result)
     }
 
     fn finish(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -1500,7 +1504,7 @@ impl ServerThread {
         }
         self.shutdown();
 
-        if let Some(join_handle) = self.join_handle.take() {
+        let result = if let Some(join_handle) = self.join_handle.take() {
             match join_handle.join() {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(error)) => Err(std::io::Error::other(error).into()),
@@ -1508,7 +1512,11 @@ impl ServerThread {
             }
         } else {
             Ok(())
-        }
+        };
+
+        self.active = false;
+        self.pairing = None;
+        result
     }
 }
 
@@ -1519,27 +1527,15 @@ fn config_snapshot(config: &SharedConfig) -> Result<AppConfig, Box<dyn std::erro
         .map_err(|_| std::io::Error::other("failed to access application config").into())
 }
 
-/// Production domain that hosts the pairing Universal Link's
-/// `apple-app-site-association` file and web fallback page (see the
-/// WakeMate-Website repo). Not a placeholder -- update alongside the
-/// website's AASA file and the mobile app's `ios.associatedDomains` /
-/// `PAIRING_LINK_HOSTS` if this domain ever changes.
-const PAIRING_LINK_BASE: &str = "https://wakematemobile.com/pair";
-
 /// Shows the native "allow this device to pair?" prompt on its own thread
 /// (so the HTTP handler that triggered it never blocks) and, only on an
 /// explicit "Yes", flips on input/power control and persists it.
-/// Builds the pairing QR code / Universal Link contents (pairing contract
-/// v3): an `https://` link so the native iPhone Camera app recognizes it as
-/// an actionable link and offers to open WakeMATE directly, carrying
-/// everything the phone needs to save this computer and pair in one scan.
+/// Builds the structured JSON contents of the pairing QR code (pairing
+/// contract v3), carrying everything the phone needs to save this computer,
+/// pin its local TLS identity, and pair in one scan without a web redirect.
 /// `token` should be a fresh one-time pairing-session token minted via
 /// `PairingCoordinator::mint_pairing_session_token` wherever one is
-/// available (see `toggle_pairing_qr_popup`); the permanent shared
-/// `api_token` is only used as a fallback when no coordinator is reachable
-/// from this process. Supersedes the raw-JSON contract v2 payload; the
-/// mobile app's QR parser still reads v2 JSON for companions that have not
-/// been restarted since updating.
+/// available (see `toggle_pairing_qr_popup`).
 fn pairing_qr_payload(
     token: &str,
     device_name: &str,
@@ -1554,7 +1550,7 @@ fn pairing_qr_payload(
         .or_else(system::local_ipv4);
     let mac = network.as_ref().and_then(|info| info.mac_address.clone());
 
-    pairing_qr_payload_from_parts(
+    pairing_qr::payload_from_parts(
         token,
         device_name,
         api_port,
@@ -1563,37 +1559,6 @@ fn pairing_qr_payload(
         ip,
         mac,
     )
-}
-
-fn pairing_qr_payload_from_parts(
-    token: &str,
-    device_name: &str,
-    api_port: u16,
-    tls_port: u16,
-    tls_fingerprint: &str,
-    ip: Option<String>,
-    mac: Option<String>,
-) -> String {
-    let mut url =
-        url::Url::parse(PAIRING_LINK_BASE).expect("PAIRING_LINK_BASE is a valid, hardcoded URL");
-
-    {
-        let mut pairs = url.query_pairs_mut();
-        pairs.append_pair("v", "3");
-        pairs.append_pair("token", token);
-        pairs.append_pair("name", device_name);
-        pairs.append_pair("api_port", &api_port.to_string());
-        pairs.append_pair("tls_port", &tls_port.to_string());
-        pairs.append_pair("fp", tls_fingerprint);
-        if let Some(ip) = ip.as_deref() {
-            pairs.append_pair("ip", ip);
-        }
-        if let Some(mac) = mac.as_deref() {
-            pairs.append_pair("mac", mac);
-        }
-    }
-
-    url.to_string()
 }
 
 fn windows_pairing_notifier(context: NotifierContext) {
@@ -1612,27 +1577,26 @@ fn windows_pairing_notifier(context: NotifierContext) {
             .unwrap_or_else(|| info.peer.to_string());
 
         let approved = system::confirm_pairing_dialog(&device_hint);
-        status.record_outcome(approved);
 
         if !approved {
             enrollment.clear();
+            status.record_outcome(false);
             info!(peer = %info.peer, "WakeMATE pairing request denied on the desktop");
             return;
         }
 
         // Commit the enrollment (if this prompt was for one) so the phone's
-        // per-device token starts authenticating.
-        if let Some(pending) = enrollment.take_valid() {
-            registry
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .register_with_id(&pending.device_id, &pending.device_name, &pending.token);
+        // per-device token starts authenticating. `commit_valid` leaves it
+        // visibly pending until the registry contains it, so status polling
+        // can never observe a false denial during this transition.
+        if let Some(pending) = enrollment.commit_valid(&registry) {
             info!(
                 device = %pending.device_name,
                 peer = %info.peer,
                 "WakeMATE registered a paired phone with its own token"
             );
         }
+        status.record_outcome(true);
 
         let outcome = (|| -> Result<(), Box<dyn std::error::Error>> {
             let mut guard = config
@@ -1743,9 +1707,8 @@ fn default_icon() -> Result<Icon, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_escape_press, pairing_qr_payload_from_parts, popup_device_label, position_popup,
-        render_pairing_popup, screen_rect_contains_point, MonitorBounds, MouseButtons, PopupAnchor,
-        ScreenPoint,
+        is_escape_press, popup_device_label, position_popup, render_pairing_popup,
+        screen_rect_contains_point, MonitorBounds, MouseButtons, PopupAnchor, ScreenPoint,
     };
     use winit::dpi::{PhysicalPosition, PhysicalSize};
     use winit::{
@@ -1804,85 +1767,8 @@ mod tests {
     }
 
     #[test]
-    fn pairing_qr_payload_is_an_https_universal_link_carrying_the_v3_contract_fields() {
-        let payload = pairing_qr_payload_from_parts(
-            "token-value",
-            "Desk Rig",
-            7777,
-            7778,
-            TEST_TLS_FINGERPRINT,
-            Some("192.168.1.50".to_string()),
-            Some("00:11:22:33:44:55".to_string()),
-        );
-
-        // Must be a real https:// URL (not raw JSON) so the native iPhone
-        // Camera app recognizes it as an actionable link.
-        assert!(payload.starts_with("https://wakematemobile.com/pair?"));
-
-        let url = url::Url::parse(&payload).unwrap();
-        let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
-
-        assert_eq!(params.get("v").map(String::as_str), Some("3"));
-        assert_eq!(params.get("name").map(String::as_str), Some("Desk Rig"));
-        assert_eq!(params.get("api_port").map(String::as_str), Some("7777"));
-        assert_eq!(params.get("tls_port").map(String::as_str), Some("7778"));
-        assert_eq!(
-            params.get("fp").map(String::as_str),
-            Some(TEST_TLS_FINGERPRINT)
-        );
-        assert_eq!(params.get("token").map(String::as_str), Some("token-value"));
-        assert_eq!(params.get("ip").map(String::as_str), Some("192.168.1.50"));
-        assert_eq!(
-            params.get("mac").map(String::as_str),
-            Some("00:11:22:33:44:55")
-        );
-    }
-
-    #[test]
-    fn pairing_qr_payload_omits_unknown_network_fields() {
-        let payload = pairing_qr_payload_from_parts(
-            "token-value",
-            "Desk Rig",
-            7777,
-            7778,
-            TEST_TLS_FINGERPRINT,
-            None,
-            None,
-        );
-
-        let url = url::Url::parse(&payload).unwrap();
-        let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
-
-        assert!(!params.contains_key("ip"));
-        assert!(!params.contains_key("mac"));
-        assert_eq!(params.get("token").map(String::as_str), Some("token-value"));
-    }
-
-    #[test]
-    fn pairing_qr_payload_percent_encodes_special_characters_in_the_device_name() {
-        // Device names are free text (e.g. "Ana's PC & Desk") -- the URL
-        // must stay well-formed and round-trip the exact original value.
-        let payload = pairing_qr_payload_from_parts(
-            "token-value",
-            "Ana's PC & Desk",
-            7777,
-            7778,
-            TEST_TLS_FINGERPRINT,
-            None,
-            None,
-        );
-
-        let url = url::Url::parse(&payload).unwrap();
-        let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
-        assert_eq!(
-            params.get("name").map(String::as_str),
-            Some("Ana's PC & Desk")
-        );
-    }
-
-    #[test]
     fn render_pairing_popup_encodes_a_v3_payload() {
-        let payload = pairing_qr_payload_from_parts(
+        let payload = crate::pairing_qr::payload_from_parts(
             "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
             "Desk Rig",
             7777,

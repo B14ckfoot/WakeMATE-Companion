@@ -28,8 +28,8 @@ cargo --version   # cargo 1.97.1
 cargo build
 ```
 
-~17s incremental, ~2min cold. 14 dead-code warnings (`server_is_reachable`,
-`open_path`, `sync_prelogon_server_task`, …) are expected — those functions are
+~17s incremental, ~2min cold. Platform-gated dead-code warnings (`open_path`,
+Windows tray helpers, …) are expected — those functions are
 only called from the Windows-gated `tray.rs`.
 
 ## Run (agent path)

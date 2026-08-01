@@ -14,6 +14,7 @@
 - On a clean Windows install, the installer prepares the first-run config with `allow_remote_connections` and `allow_discovery` enabled so the mobile app can auto-discover the PC immediately. This is a deliberate, disclosed product tradeoff for first-run UX, not an oversight -- it widens the network attack surface (an unauthenticated UDP probe gets a device-name/IP/MAC reply) on a clean install before the user has done anything, in exchange for the mobile app being able to find the PC without manual IP entry.
 - Existing configs are preserved on reinstall or upgrade.
 - Input and power commands still stay disabled, and pairing still requires desktop approval, regardless of this installer default.
+- Per-user config, Credential Manager, and HKCU startup preparation run as the original interactive user after a normal UAC elevation. Elevated installer work is limited to machine-scoped files, prerequisites, firewall changes, and removal of the retired SYSTEM boot task.
 
 ## Threat Model
 
@@ -22,12 +23,12 @@ Considered explicitly:
 | Threat | Mitigation | Residual risk |
 | --- | --- | --- |
 | Attacker on the same LAN sniffing traffic | Current mobile builds use HTTPS and pin the self-signed leaf certificate's SHA-256 fingerprint from the visual QR channel | Traffic from a legacy client remains observable while the transitional HTTP listener is enabled. Disable `allow_insecure_http` after all phones have upgraded and re-scanned. |
-| Attacker who has obtained a valid token (leak, screenshot, shoulder-surf of the QR code) | Rate limiting slows brute force; pairing activation now requires an explicit desktop click, not just a valid token | Once the token is known, `/v1/wake`, `/v1/info`, and (if already paired) `/v1/command` are usable until the token is rotated. Rotation invalidates every paired phone at once (no per-device revocation yet). |
+| Attacker who has obtained a valid token (leak, screenshot, shoulder-surf of the QR code) | The QR normally carries a fresh single-use pairing-session token with a 10-minute lifetime, enrollment still requires explicit desktop approval, and each approved phone receives its own revocable device token | A stolen approved-device token retains that device's capabilities until it is revoked from the tray. Rotating the shared pairing credential revokes every device at once. |
 | Blind token brute force | Constant-time comparison + per-IP lockout (8 failures / 60s window -> 60s lockout, shared across all authenticated endpoints) | A distributed brute force across many source IPs is not rate-limited; token entropy (a v4 UUID, ~122 bits) is the remaining defense there. |
 | A malicious website in the user's browser trying to drive the API | Auth requires a custom header (`x-wakemate-token`), which a simple cross-origin form post cannot set, and which triggers a CORS preflight for `fetch`/`XHR` that the app doesn't need to explicitly allow (no `Access-Control-Allow-Origin` is returned, so the browser blocks reading the response and, for state-changing requests, blocks the request from completing for a script that doesn't already know the token) | No Origin/Host allowlist is enforced server-side as defense in depth; recommended future work. |
 | Malicious/compromised paired phone silently enabling input/power control | `/v1/pairing/activate` now shows a native, always-on-top desktop dialog naming the requesting IP and requires an explicit "Yes" before flipping `allow_input_commands`/`allow_power_commands` | The dialog shows an IP, not a verified device identity; there is no cryptographic device-identity check. |
-| The pre-logon boot service (`schtasks /RU SYSTEM`) being reachable before anyone signs in | The headless server refuses pairing activation and every input command unconditionally, regardless of config | It still executes power actions (sleep/restart/shutdown) if `allow_power_commands` was already enabled through a prior, approved pairing -- this is intentional (remote-restarting a hung headless machine is a legitimate use case) but is a real capability exposed at elevated privilege before login. |
-| Excessive OS privilege | Everything except the pre-logon boot task runs as the interactive user, not SYSTEM/admin | The boot task itself must run as SYSTEM because Windows Task Scheduler requires that account (or stored credentials) for an `ONSTART` trigger with "run whether logged in or not"; see the table row above for the compensating control. |
+| A privileged server resolving different secrets and TLS state than the signed-in user's tray | Current installers remove the retired SYSTEM/ONSTART task, and stale `--headless-server` invocations exit before reading user state or binding a listener | Companion API status/control is unavailable until the user signs in and the normal-user tray starts. Direct Wake-on-LAN from the phone remains available before sign-in. |
+| Excessive OS privilege | The running companion is the normal-user tray process; no Companion API runs as SYSTEM | The installer still needs administrator approval for Program Files, prerequisites, firewall configuration, and legacy task cleanup. |
 | Tampered/malicious update package | No auto-update mechanism exists yet | N/A today; if auto-update is added, it must verify a signature before replacing the running binary. |
 | Local file tampering / insecure local files | Config file no longer holds the token once migrated to the credential store. The persistent TLS certificate/private key identity is stored in the user's app-data folder and is created mode `0600` on Unix. A corrupt identity is rejected rather than silently replaced. | A local attacker with the same OS user account can still read/write the config, TLS identity, and any fallback plaintext token. On Windows the app-data file relies on the user's directory ACLs. |
 | Debug functionality left on in production | No `RUST_LOG=debug`/devtools-equivalent shipped enabled; tracing defaults to `info` and never logs the token itself (only its length, e.g. on rotation) | -- |
@@ -40,7 +41,9 @@ For upgrade compatibility, `allow_insecure_http` defaults to `true` and keeps th
 
 ## Current Authentication
 
-- Single shared bearer token via `x-wakemate-token`, compared in constant time, stored in the OS credential store
+- Pairing-session and per-device bearer tokens via `x-wakemate-token`, compared in constant time; only per-device token hashes are stored in the local registry
+- Shared pairing credential stored in the OS credential store, used to mint short-lived single-use QR sessions; rotation revokes all enrolled devices
+- Per-device revocation from the tray without disrupting other approved phones
 - Per-IP rate limiting/lockout on repeated authentication failures across all authenticated endpoints
 - Explicit desktop confirmation gate before pairing can grant input/power capabilities
 - No built-in account system
@@ -57,4 +60,4 @@ For upgrade compatibility, `allow_insecure_http` defaults to `true` and keeps th
 
 ## Release Recommendation
 
-Before exposing WakeMATE beyond a trusted home LAN in a production release, prioritize (in order): (1) end the HTTP migration window and default `allow_insecure_http` to `false`, (2) per-device pairing/revocation instead of a single shared token, and (3) an Origin/Host allowlist as defense in depth against browser-based abuse.
+Before exposing WakeMATE beyond a trusted home LAN in a production release, prioritize (in order): (1) end the HTTP migration window and default `allow_insecure_http` to `false`, and (2) add an Origin/Host allowlist as defense in depth against browser-based abuse.

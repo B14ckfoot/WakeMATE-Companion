@@ -8,7 +8,7 @@ WakeMATE Companion's source **compiles and runs on macOS today**, but only as a 
 - `src/system.rs` already has macOS branches for `sleep` (`pmset sleepnow`), `restart`/`shutdown` (`shutdown -r|-h now`), and `open_path` (`open`). `lock` and `logoff` are not implemented on macOS yet (`perform_system_action` returns a clear "not implemented" error for those two, rather than doing nothing silently).
 - There is **no tray/menu-bar icon, no pairing QR window, and no login-item toggle on macOS**. `src/tray.rs` -- the icon, the pairing popup, the "Reset Companion" flow, the desktop pairing-confirmation dialog -- is entirely behind `#[cfg(target_os = "windows")]`.
 
-Practically: a macOS build today is a background network service you'd start from a terminal or a launchd plist, with the same HTTP API as Windows (Wake-on-LAN, health/info, and -- once separately approved, see below -- remote input/power), but no visual presence and no way to approve a pairing request from the desktop, so **pairing activation is refused on macOS today** (same as the Windows headless pre-logon service; see `PairingCoordinator::unavailable()` in `src/pairing.rs`). It is not a finished consumer app.
+Practically: a macOS build today is a background network service you'd start from a terminal or a launchd plist, with the same HTTP API as Windows (Wake-on-LAN, health/info, and -- once separately approved, see below -- remote input/power), but no visual presence and no way to approve a pairing request from the desktop, so **pairing activation is refused on macOS today** (see `PairingCoordinator::unavailable()` in `src/pairing.rs`). It is not a finished consumer app.
 
 This document describes exactly what's needed to close that gap, and how to package what exists today into a `.dmg` in CI.
 
@@ -18,7 +18,7 @@ The Windows tray implementation depends on:
 
 1. **`winit`'s Windows-only extension trait** (`platform::windows::{CornerPreference, WindowAttributesExtWindows}`) for the borderless, rounded, shadowed popup window.
 2. **Raw `GetAsyncKeyState`/`GetCursorPos` Win32 calls** for click-away detection outside the popup (in addition to the `WindowEvent::Focused(false)` handler, which already exists and may be sufficient on its own).
-3. **Win32 registry calls** for the "launch on startup" toggle and **`schtasks.exe`** for the pre-logon boot task.
+3. **Win32 registry calls** for the "launch on startup" toggle.
 4. **A raw `MessageBoxW` call** for the native pairing-confirmation dialog.
 
 `tray-icon`, `winit`, and `softbuffer` (the three crates the popup rendering depends on) do all declare macOS support, and the QR/text-rendering code in `tray.rs` (the `render_pairing_popup`, `draw_qr_code`, `draw_text` functions and friends) is already 100% cross-platform pixel-buffer code with no Windows-specific calls -- that part could move to macOS largely as-is. But items 1, 3, and 4 above need real macOS-specific replacements, and there is no macOS machine or CI runner available in this working session to compile-check or visually verify that port. Shipping unverified, hand-written AppKit/Cocoa-adjacent code as if it were tested would violate this project's own instruction not to claim untested platform work is production-ready, so it was intentionally left as documented follow-up work rather than guessed at.
@@ -33,7 +33,7 @@ The Windows tray implementation depends on:
 3. **`src/system.rs`**: add macOS equivalents for:
    - `sync_launch_on_startup` -- write/remove a `~/Library/LaunchAgents/com.wakemate.companion.plist` (a `launchctl load`/`unload` pair, or `SMAppService` on macOS 13+) instead of a registry Run key.
    - `enable_preferred_dark_mode` -- not applicable; macOS apps follow the system appearance automatically, so this can just stay a no-op.
-   - `sync_prelogon_server_task` -- **there is no direct macOS equivalent to a Windows `ONSTART` scheduled task that runs before any user logs in without additional privileged installation.** The closest analog is a `LaunchDaemon` (root-owned, in `/Library/LaunchDaemons`, installed by a privileged installer step), which is a meaningfully bigger trust boundary than a per-user LaunchAgent. Recommend treating this as out of scope for macOS unless there's real demand for pre-login wake status there, and documenting that macOS WakeMATE only runs once a user is logged in.
+   - Do not add a privileged `LaunchDaemon` for pre-login networking. Windows also intentionally avoids a privileged pre-login Companion server now; direct phone Wake-on-LAN covers waking without splitting user-scoped credentials/TLS state across security principals.
    - Implement `lock` (there is no simple CLI equivalent to Windows' `LockWorkStation`; the common approach is `osascript -e 'tell application "System Events" to keystroke "q" using {control down, command down}'` or invoking the login window via a small Swift/ObjC helper) and `logoff` (`osascript -e 'tell application "System Events" to log out'`, which prompts the user rather than forcing it -- macOS does not have a silent forced-logoff CLI primitive by default).
 
 ## Packaging: What Exists Today

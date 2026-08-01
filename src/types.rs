@@ -383,8 +383,7 @@ mod tests {
 
     #[test]
     fn security_screen_without_a_fallback_defaults_to_touching_nothing() {
-        let parsed: CommandRequest =
-            serde_json::from_str(r#"{"type":"security_screen"}"#).unwrap();
+        let parsed: CommandRequest = serde_json::from_str(r#"{"type":"security_screen"}"#).unwrap();
         assert!(matches!(
             parsed,
             CommandRequest::SecurityScreen {

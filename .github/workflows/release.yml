@@ -24,6 +24,27 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Verify tag matches Cargo and installer versions
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = $metadata.packages[0].version
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Release tag '${{ github.ref_name }}' does not match Cargo version '$version'."
+          }
+          $installerSource = Get-Content ".\installer\wakemate-companion.iss" -Raw
+          $installerMatch = [regex]::Match(
+            $installerSource,
+            '(?m)^#define\s+MyAppVersion\s+"([^"]+)"\s*$'
+          )
+          if (-not $installerMatch.Success) {
+            throw "Could not read MyAppVersion from the Inno Setup definition."
+          }
+          $installerVersion = $installerMatch.Groups[1].Value
+          if ($installerVersion -ne $version) {
+            throw "Inno Setup version '$installerVersion' does not match Cargo version '$version'."
+          }
+
       - name: cargo test
         run: cargo test --release --locked
 
@@ -41,16 +62,21 @@ jobs:
       - name: Checksum
         shell: pwsh
         run: |
-          Get-FileHash "dist\installer\WakeMATE+Companion+Setup.exe" -Algorithm SHA256 |
-            ForEach-Object { "$($_.Hash)  WakeMATE-Companion-Setup.exe" } |
-            Out-File -Encoding ascii dist\installer\WakeMATE-Companion-Setup.exe.sha256
+          $installers = @(Get-ChildItem "dist\installer\WakeMATE-Companion-Setup-v*.exe")
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one versioned WakeMATE installer, found $($installers.Count)."
+          }
+          $installer = $installers[0]
+          Get-FileHash $installer.FullName -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash)  $($installer.Name)" } |
+            Out-File -Encoding ascii "$($installer.FullName).sha256"
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows-installer
           path: |
-            dist/installer/WakeMATE+Companion+Setup.exe
-            dist/installer/WakeMATE-Companion-Setup.exe.sha256
+            dist/installer/WakeMATE-Companion-Setup-v*.exe
+            dist/installer/WakeMATE-Companion-Setup-v*.exe.sha256
           if-no-files-found: error
 
   macos:

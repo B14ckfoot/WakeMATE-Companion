@@ -81,9 +81,7 @@ pub enum SasEligibility {
 /// `uiAccess` desktop app needs policy 2 or 3.
 ///
 /// WakeMATE's interactive tray host can only ever qualify through the
-/// `uiAccess` branch -- the pre-logon `--headless-server` instance is a
-/// service, but it is refused earlier because no one is signed in for a
-/// security screen to appear in front of.
+/// `uiAccess` branch. Production builds do not start a service-hosted API.
 pub fn evaluate_eligibility(policy: u32, has_uiaccess: bool, is_service: bool) -> SasEligibility {
     if !is_service && !has_uiaccess {
         return SasEligibility::CallerNotPrivileged;
@@ -150,9 +148,8 @@ mod windows_impl {
     type SendSasFn = unsafe extern "system" fn(i32);
 
     pub fn request_secure_attention_sequence() -> SasOutcome {
-        // WakeMATE's tray host is a normal interactive process. The only
-        // service-hosted instance (`--headless-server`) never reaches this
-        // code, so the service branch of the rule is always false here.
+        // WakeMATE's tray host is a normal interactive process, so the
+        // service branch of the rule is always false here.
         const IS_SERVICE: bool = false;
 
         let policy = software_sas_generation();
@@ -345,7 +342,10 @@ mod tests {
         assert!(policy_off.contains("Secure Attention Sequence"));
 
         for detail in [not_privileged, policy_off] {
-            assert!(!detail.contains('\\'), "details must stay path-free: {detail}");
+            assert!(
+                !detail.contains('\\'),
+                "details must stay path-free: {detail}"
+            );
         }
     }
 

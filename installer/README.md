@@ -13,23 +13,28 @@ This folder contains an Inno Setup template for packaging WakeMATE Companion as 
 
 ## Build
 
-Build the release binary:
-
-`powershell -NoProfile -ExecutionPolicy Bypass -File .\build-release.ps1`
-
-Then compile the installer:
+Compile the installer with:
 
 `powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\build-installer.ps1`
 
-Or have the installer script force a fresh release build first:
-
-`powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\build-installer.ps1 -BuildRelease`
+The installer script always runs `build-release.ps1` first. This prevents an
+older executable left in `target\release` from being packaged under the new
+installer version. CI may use `-SkipPrereqCheck` only after its workflow has
+already built the release executable in the same job.
 
 Open Inno Setup and compile:
 
 `installer\wakemate-companion.iss`
 
 The installer will bundle `installer\redist\VC_redist.x64.exe` and silently install it only when the target machine does not already have the Visual C++ runtime.
+
+Start Setup normally from Explorer and approve its UAC prompt; do not use
+**Run as administrator**. Setup runs the per-user config/Windows Credential
+Manager/startup preparation with Inno Setup's `runasoriginaluser` flag, while
+firewall changes and cleanup of the retired SYSTEM boot task stay elevated.
+Windows cannot recover the unelevated original-user token when Setup itself
+was launched already elevated, so right-click elevation can place per-user
+state in the wrong account on an over-the-shoulder administrator install.
 
 ## Signing
 

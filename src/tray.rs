@@ -114,24 +114,45 @@ impl TrayApp {
         })
     }
 
+    /// Builds the tray menu.
+    ///
+    /// The top level is deliberately limited to the handful of things someone
+    /// opens the tray to actually do: see whether WakeMATE is working, see
+    /// which phones are connected, show the pairing code, and get out of
+    /// trouble (restart / quit). Everything that is configuration rather than
+    /// an action -- startup behavior, credential rotation, the data folder,
+    /// and the destructive reset -- lives under "Settings" so the first level
+    /// stays readable. Nothing was removed; every previous item is still
+    /// reachable in at most one extra click.
     fn initialize_tray(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = config_snapshot(&self.config)?;
         let menu = Menu::new();
         let status = MenuItem::new(self.status_label(), false, None);
-        let show_pairing_qr = MenuItem::new("View Pairing QR Code", true, None);
-        let paired_devices = Submenu::new("Paired Devices", true);
-        let rotate_pairing_token = MenuItem::new("Rotate Pairing Token", true, None);
+        let paired_devices = Submenu::new("Connected Devices", true);
+        let show_pairing_qr = MenuItem::new("QR Code", true, None);
+        let restart_connection = MenuItem::new("Restart Connection", true, None);
+        let quit = MenuItem::new("Quit WakeMATE", true, None);
+
+        // Settings submenu: configuration and recovery, not everyday actions.
+        let settings = Submenu::new("Settings", true);
         let launch_on_startup = CheckMenuItem::new(
             "Launch on Windows Startup",
             true,
             snapshot.launch_on_startup,
             None,
         );
+        let rotate_pairing_token = MenuItem::new("Rotate Pairing Token", true, None);
         let open_data_folder = MenuItem::new("Open Data Folder", true, None);
         let reset_companion = MenuItem::new("Reset Companion...", true, None);
-        let quit = MenuItem::new("Quit WakeMATE", true, None);
+        let settings_separator = PredefinedMenuItem::separator();
+
+        settings.append(&launch_on_startup)?;
+        settings.append(&rotate_pairing_token)?;
+        settings.append(&settings_separator)?;
+        settings.append(&open_data_folder)?;
+        settings.append(&reset_companion)?;
+
         let separator_top = PredefinedMenuItem::separator();
-        let separator_middle = PredefinedMenuItem::separator();
         let separator_bottom = PredefinedMenuItem::separator();
 
         let tray_menu = TrayMenu {
@@ -140,6 +161,7 @@ impl TrayApp {
             paired_devices: paired_devices.clone(),
             ids: MenuIds {
                 show_pairing_qr: show_pairing_qr.id().clone(),
+                restart_connection: restart_connection.id().clone(),
                 rotate_pairing_token: rotate_pairing_token.id().clone(),
                 launch_on_startup: launch_on_startup.id().clone(),
                 open_data_folder: open_data_folder.id().clone(),
@@ -150,13 +172,10 @@ impl TrayApp {
 
         menu.append(&status)?;
         menu.append(&separator_top)?;
-        menu.append(&show_pairing_qr)?;
         menu.append(&paired_devices)?;
-        menu.append(&rotate_pairing_token)?;
-        menu.append(&launch_on_startup)?;
-        menu.append(&separator_middle)?;
-        menu.append(&open_data_folder)?;
-        menu.append(&reset_companion)?;
+        menu.append(&show_pairing_qr)?;
+        menu.append(&settings)?;
+        menu.append(&restart_connection)?;
         menu.append(&separator_bottom)?;
         menu.append(&quit)?;
 
@@ -176,7 +195,7 @@ impl TrayApp {
         Ok(())
     }
 
-    /// Rebuilds the "Paired Devices" submenu when the registry changed
+    /// Rebuilds the "Connected Devices" submenu when the registry changed
     /// (a new approval from the notifier thread, or a revocation here).
     fn refresh_paired_devices_menu(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let devices = self
@@ -280,6 +299,7 @@ impl TrayApp {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let Some((
             show_pairing_qr,
+            restart_connection,
             rotate_pairing_token,
             launch_on_startup,
             open_data_folder,
@@ -288,6 +308,7 @@ impl TrayApp {
         )) = self.tray_menu.as_ref().map(|tray_menu| {
             (
                 tray_menu.ids.show_pairing_qr.clone(),
+                tray_menu.ids.restart_connection.clone(),
                 tray_menu.ids.rotate_pairing_token.clone(),
                 tray_menu.ids.launch_on_startup.clone(),
                 tray_menu.ids.open_data_folder.clone(),
@@ -301,6 +322,8 @@ impl TrayApp {
 
         if event.id == show_pairing_qr {
             self.toggle_pairing_qr_popup(event_loop)?;
+        } else if event.id == restart_connection {
+            self.restart_connection()?;
         } else if event.id == rotate_pairing_token {
             self.rotate_pairing_token()?;
         } else if event.id == launch_on_startup {
@@ -460,6 +483,37 @@ impl TrayApp {
             owner_window,
         )?);
 
+        Ok(())
+    }
+
+    /// Stops and restarts the local server listeners.
+    ///
+    /// This is the "turn it off and on again" recovery path for the common
+    /// case where the listeners survive but are no longer usable -- the PC
+    /// changed networks, resumed from sleep on a different adapter, or the
+    /// bound address went away underneath the running server. It deliberately
+    /// touches nothing else: pairings, tokens, and the TLS identity all
+    /// persist, so no phone has to be paired again afterwards.
+    ///
+    /// This is also the recovery path for a server that already died on its
+    /// own (a failed bind, a panic). `refresh_server_health` latches that into
+    /// `startup_error`, which otherwise persists for the rest of the session
+    /// and is re-raised on quit, so a successful restart clears it -- a stale
+    /// error would keep reporting a failure that no longer exists.
+    fn restart_connection(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // Close the QR popup first: its payload names ports the restarted
+        // server may not come back on, and its pairing-session token belongs
+        // to the coordinator that is about to be replaced.
+        self.pairing_popup = None;
+
+        info!("WakeMATE restarting the local server from the tray");
+        // `ServerThread::restart` stops a live server first and respawns
+        // either way, so this recovers a crashed one as well.
+        self.server
+            .restart(self.config.clone(), self.registry.clone())?;
+        self.startup_error = None;
+        self.refresh_tray_state()?;
+        info!("WakeMATE server restarted");
         Ok(())
     }
 
@@ -625,7 +679,7 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                 error!(error = %error, "failed to reload config changes from disk");
             }
             // Approvals land on the notifier thread; pick them up here so
-            // the "Paired Devices" submenu stays current.
+            // the "Connected Devices" submenu stays current.
             if let Err(error) = self.refresh_paired_devices_menu() {
                 error!(error = %error, "failed to refresh the paired-devices menu");
             }
@@ -664,6 +718,7 @@ enum UserEvent {
 
 struct MenuIds {
     show_pairing_qr: MenuId,
+    restart_connection: MenuId,
     rotate_pairing_token: MenuId,
     launch_on_startup: MenuId,
     open_data_folder: MenuId,

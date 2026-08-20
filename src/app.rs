@@ -472,6 +472,7 @@ fn security_screen(
             fallback_used: false,
             detail: "Windows accepted the Secure Attention Sequence".to_string(),
         },
+        #[cfg(not(target_os = "windows"))]
         SasOutcome::Unsupported { detail } => {
             apply_fallback(fallback, SecurityCommandStatus::Unsupported, detail)
         }

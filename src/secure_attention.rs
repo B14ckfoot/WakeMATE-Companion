@@ -49,6 +49,7 @@ pub enum SasOutcome {
     /// This computer can do it, but not from this process as configured.
     PermissionRequired { detail: String },
     /// This operating system has no Secure Attention Sequence at all.
+    #[cfg(not(target_os = "windows"))]
     Unsupported { detail: String },
     /// Eligible, but the call itself failed.
     Failed { detail: String },
@@ -239,8 +240,8 @@ mod windows_impl {
             return Err("this Windows installation does not provide sas.dll".to_string());
         }
 
-        // Safety: `b"SendSAS\0"` is a valid null-terminated ANSI name.
-        let entry = unsafe { GetProcAddress(module, b"SendSAS\0".as_ptr()) };
+        // Safety: the C string is a valid null-terminated ANSI name.
+        let entry = unsafe { GetProcAddress(module, c"SendSAS".as_ptr().cast()) };
 
         let Some(entry) = entry else {
             unsafe {

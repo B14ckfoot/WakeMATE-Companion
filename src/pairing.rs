@@ -101,6 +101,7 @@ impl EnrollmentSlot {
 
     /// Takes the pending enrollment if it has not expired. An expired entry
     /// is discarded either way.
+    #[cfg(test)]
     pub fn take_valid(&self) -> Option<PendingEnrollment> {
         let pending = self.lock().take()?;
         if pending.expired() {
@@ -354,12 +355,14 @@ impl PairingCoordinator {
 
     /// Consumes the current pairing-session token for a state-changing
     /// pairing action. See [`PairingSessionSlot::try_consume`].
+    #[cfg(test)]
     pub fn consume_pairing_session_token(&self, candidate: &str) -> bool {
         self.session.try_consume(candidate)
     }
 
     /// No desktop UI is available to confirm pairing (for example, a platform
     /// build without a tray yet).
+    #[cfg(any(not(target_os = "windows"), test))]
     pub fn unavailable() -> Self {
         Self::new(None)
     }

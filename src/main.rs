@@ -36,10 +36,13 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use crate::{
     app::{router, AppState},
     config::{AppConfig, SharedConfig},
-    devices::{DeviceRegistry, SharedDeviceRegistry},
+    devices::SharedDeviceRegistry,
     pairing::PairingCoordinator,
     tls::TlsIdentity,
 };
+
+#[cfg(not(target_os = "windows"))]
+use crate::devices::DeviceRegistry;
 
 const PREPARE_INSTALL_CONFIG_ARG: &str = "--prepare-install-config";
 const HEADLESS_SERVER_ARG: &str = "--headless-server";

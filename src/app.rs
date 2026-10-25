@@ -217,9 +217,7 @@ async fn pairing_enroll(
     let device_name = request
         .device_name
         .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(|name| name.chars().take(MAX_DEVICE_NAME_CHARS).collect::<String>())
+        .and_then(sanitize_device_name)
         .unwrap_or_else(|| format!("Phone at {}", peer.ip()));
 
     let pending = PendingEnrollment::new(device_name);
@@ -714,6 +712,37 @@ fn authenticate_inner(
     Ok(credential)
 }
 
+/// Normalizes the phone-supplied name before it reaches the desktop approval
+/// prompt and the tray menu. Control and line-break characters are dropped and
+/// whitespace runs collapse to one space, so a phone cannot lay out its own
+/// text inside the approval dialog to make it read like a different request.
+fn sanitize_device_name(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .map(|ch| if ch.is_whitespace() { ' ' } else { ch })
+        .filter(|ch| !ch.is_control() && !is_invisible_format_char(*ch))
+        .collect();
+    let name = cleaned
+        .split(' ')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(MAX_DEVICE_NAME_CHARS)
+        .collect::<String>();
+    let name = name.trim_end().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Bidirectional overrides and zero-width characters can reorder or hide text
+/// in the approval dialog without being control characters.
+fn is_invisible_format_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
+    )
+}
+
 fn registry_snapshot(
     state: &AppState,
 ) -> Result<std::sync::MutexGuard<'_, crate::devices::DeviceRegistry>, AppError> {
@@ -754,4 +783,47 @@ fn config_snapshot(config: &SharedConfig) -> Result<AppConfig, AppError> {
         .lock()
         .map(|guard| guard.clone())
         .map_err(|_| AppError::internal("failed to access application config"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sanitize_device_name, MAX_DEVICE_NAME_CHARS};
+
+    #[test]
+    fn device_name_keeps_ordinary_names() {
+        assert_eq!(
+            sanitize_device_name("  Ana's iPhone 15  ").as_deref(),
+            Some("Ana's iPhone 15")
+        );
+    }
+
+    #[test]
+    fn device_name_flattens_line_breaks_and_controls() {
+        assert_eq!(
+            sanitize_device_name("Phone\n\nWindows Update\r\tsays\u{0007} yes").as_deref(),
+            Some("Phone Windows Update says yes")
+        );
+    }
+
+    #[test]
+    fn device_name_drops_bidi_and_zero_width_characters() {
+        assert_eq!(
+            sanitize_device_name("Pho\u{200B}ne\u{202E}gnp.exe").as_deref(),
+            Some("Phonegnp.exe")
+        );
+    }
+
+    #[test]
+    fn device_name_that_is_only_noise_falls_back() {
+        assert_eq!(sanitize_device_name(" \n\u{200B}\t "), None);
+    }
+
+    #[test]
+    fn device_name_is_length_capped() {
+        let long = "x".repeat(MAX_DEVICE_NAME_CHARS * 2);
+        assert_eq!(
+            sanitize_device_name(&long).map(|name| name.chars().count()),
+            Some(MAX_DEVICE_NAME_CHARS)
+        );
+    }
 }

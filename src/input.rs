@@ -53,44 +53,23 @@ impl InputController {
     }
 
     pub fn key_press(&self, key: &str) -> Result<(), String> {
+        let keys = parse_key_combo(key)?;
+        let Some((last, modifiers)) = keys.split_last() else {
+            return Err("key combination is empty".to_string());
+        };
+
+        // Every part is parsed before anything is pressed, so an unknown key
+        // fails cleanly instead of leaving earlier modifiers held down on the
+        // desktop.
         let mut enigo = Enigo::new();
-
-        if key.contains('+') {
-            let parts: Vec<&str> = key
-                .split('+')
-                .map(str::trim)
-                .filter(|part| !part.is_empty())
-                .collect();
-
-            if parts.is_empty() {
-                return Err("key combination is empty".to_string());
-            }
-
-            if is_secure_attention_combo(&parts) {
-                return Err(SECURE_ATTENTION_REJECTION.to_string());
-            }
-
-            for modifier in parts.iter().take(parts.len().saturating_sub(1)) {
-                let parsed = parse_key(modifier)
-                    .ok_or_else(|| format!("unsupported modifier: {modifier}"))?;
-                enigo.key_down(parsed);
-            }
-
-            let last = parts.last().copied().unwrap_or_default();
-            let parsed = parse_key(last).ok_or_else(|| format!("unsupported key: {last}"))?;
-            enigo.key_click(parsed);
-
-            for modifier in parts.iter().take(parts.len().saturating_sub(1)).rev() {
-                let parsed = parse_key(modifier)
-                    .ok_or_else(|| format!("unsupported modifier: {modifier}"))?;
-                enigo.key_up(parsed);
-            }
-
-            return Ok(());
+        for modifier in modifiers {
+            enigo.key_down(*modifier);
+        }
+        enigo.key_click(*last);
+        for modifier in modifiers.iter().rev() {
+            enigo.key_up(*modifier);
         }
 
-        let parsed = parse_key(key).ok_or_else(|| format!("unsupported key: {key}"))?;
-        enigo.key_click(parsed);
         Ok(())
     }
 
@@ -141,13 +120,41 @@ fn is_secure_attention_combo(parts: &[&str]) -> bool {
     for part in parts {
         match part.trim().to_ascii_lowercase().as_str() {
             "ctrl" | "control" => has_control = true,
-            "alt" => has_alt = true,
+            "alt" | "option" => has_alt = true,
             "delete" | "del" => has_delete = true,
             _ => return false,
         }
     }
 
     has_control && has_alt && has_delete
+}
+
+/// Parses `"ctrl+shift+t"` style input into keys, refusing Ctrl+Alt+Delete.
+fn parse_key_combo(key: &str) -> Result<Vec<Key>, String> {
+    if !key.contains('+') {
+        return parse_key(key)
+            .map(|parsed| vec![parsed])
+            .ok_or_else(|| format!("unsupported key: {key}"));
+    }
+
+    let parts: Vec<&str> = key
+        .split('+')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+
+    if parts.is_empty() {
+        return Err("key combination is empty".to_string());
+    }
+
+    if is_secure_attention_combo(&parts) {
+        return Err(SECURE_ATTENTION_REJECTION.to_string());
+    }
+
+    parts
+        .iter()
+        .map(|part| parse_key(part).ok_or_else(|| format!("unsupported key: {part}")))
+        .collect()
 }
 
 fn map_mouse_button(button: MouseButtonArg) -> MouseButton {
@@ -178,7 +185,8 @@ fn parse_key(raw: &str) -> Option<Key> {
         "pagedown" => Some(Key::PageDown),
         "shift" => Some(Key::Shift),
         "ctrl" | "control" => Some(Key::Control),
-        "alt" => Some(Key::Alt),
+        // The phone labels Alt as Option when the companion is a Mac.
+        "alt" | "option" => Some(Key::Alt),
         "meta" | "win" | "command" | "cmd" | "super" => Some(Key::Meta),
         "f1" => Some(Key::F1),
         "f2" => Some(Key::F2),
@@ -211,7 +219,7 @@ fn parse_key(raw: &str) -> Option<Key> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_secure_attention_combo;
+    use super::{is_secure_attention_combo, parse_key_combo};
 
     #[test]
     fn detects_the_secure_attention_sequence_in_any_spelling_or_order() {
@@ -221,6 +229,7 @@ mod tests {
             vec!["CTRL", "Alt", "Delete"],
             vec!["delete", "ctrl", "alt"],
             vec!["alt", "delete", "control"],
+            vec!["ctrl", "option", "delete"],
         ] {
             assert!(
                 is_secure_attention_combo(&combo),
@@ -243,5 +252,24 @@ mod tests {
                 "{combo:?} is a normal shortcut and must still be sent"
             );
         }
+    }
+
+    #[test]
+    fn combo_with_an_unknown_key_is_rejected_before_anything_is_pressed() {
+        let error = parse_key_combo("ctrl+shift+notakey").unwrap_err();
+        assert_eq!(error, "unsupported key: notakey");
+    }
+
+    #[test]
+    fn combos_parse_every_part_in_order() {
+        assert_eq!(parse_key_combo("ctrl+shift+t").unwrap().len(), 3);
+        assert_eq!(parse_key_combo("option+shift").unwrap().len(), 2);
+        assert_eq!(parse_key_combo("enter").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn combo_parser_refuses_the_secure_attention_sequence() {
+        assert!(parse_key_combo("ctrl+alt+delete").is_err());
+        assert!(parse_key_combo("+").is_err());
     }
 }

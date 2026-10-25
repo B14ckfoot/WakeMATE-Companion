@@ -31,12 +31,26 @@ pub fn tokens_match(provided: &str, expected: &str) -> bool {
 const MAX_FAILURES_PER_WINDOW: u32 = 8;
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const LOCKOUT_DURATION: Duration = Duration::from_secs(60);
+/// Above this many tracked addresses, stale records are pruned before a new
+/// failure is recorded, so a burst of failures from many source addresses
+/// (easy with IPv6) cannot grow the table without bound.
+const PRUNE_THRESHOLD: usize = 1024;
 
 #[derive(Default)]
 struct AttemptRecord {
     failures: u32,
     window_started_at: Option<Instant>,
     locked_until: Option<Instant>,
+}
+
+impl AttemptRecord {
+    /// Still relevant: either locked out or inside its counting window.
+    fn is_active(&self, now: Instant) -> bool {
+        self.locked_until.is_some_and(|until| until > now)
+            || self
+                .window_started_at
+                .is_some_and(|started| now.duration_since(started) <= FAILURE_WINDOW)
+    }
 }
 
 /// A simple per-IP fixed-window lockout for authenticated endpoints. This is
@@ -76,6 +90,9 @@ impl RateLimiter {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let now = Instant::now();
+        if attempts.len() >= PRUNE_THRESHOLD {
+            attempts.retain(|_, record| record.is_active(now));
+        }
         let record = attempts.entry(addr).or_default();
 
         let window_expired = record
@@ -161,6 +178,35 @@ mod tests {
             limiter.record_failure(addr);
         }
         assert!(limiter.locked_out(addr).is_some());
+    }
+
+    #[test]
+    fn stale_records_are_pruned_once_the_table_is_large() {
+        let limiter = RateLimiter::new();
+        {
+            let mut attempts = limiter.attempts.lock().unwrap();
+            let stale = Instant::now() - (FAILURE_WINDOW + Duration::from_secs(5));
+            for index in 0..PRUNE_THRESHOLD as u32 {
+                attempts.insert(
+                    IpAddr::from(std::net::Ipv4Addr::from(index)),
+                    AttemptRecord {
+                        failures: 1,
+                        window_started_at: Some(stale),
+                        locked_until: None,
+                    },
+                );
+            }
+        }
+
+        let locked: IpAddr = "192.168.1.50".parse().unwrap();
+        for _ in 0..MAX_FAILURES_PER_WINDOW {
+            limiter.record_failure(locked);
+        }
+
+        let attempts = limiter.attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 1);
+        drop(attempts);
+        assert!(limiter.locked_out(locked).is_some());
     }
 
     #[test]

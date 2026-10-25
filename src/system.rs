@@ -1,5 +1,5 @@
 use std::{
-    net::{Ipv4Addr, UdpSocket},
+    net::{Ipv4Addr, SocketAddrV4, UdpSocket},
     path::Path,
     process::Command,
 };
@@ -109,15 +109,35 @@ pub fn send_wol(mac: &str, broadcast: &str, port: u16) -> Result<(), String> {
         packet.extend_from_slice(&mac);
     }
 
+    let target = parse_wol_target(broadcast)?;
+
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|error| error.to_string())?;
     socket
         .set_broadcast(true)
         .map_err(|error| error.to_string())?;
     socket
-        .send_to(&packet, format!("{broadcast}:{port}"))
+        .send_to(&packet, SocketAddrV4::new(target, port))
         .map_err(|error| error.to_string())?;
 
     Ok(())
+}
+
+/// Accepts only a literal IPv4 address on the local network. A hostname
+/// would make the companion perform DNS lookups on a phone's behalf, and a
+/// public address would let a paired phone use this computer to send UDP
+/// packets to arbitrary Internet hosts. Neither is needed to wake a machine
+/// on the same LAN.
+fn parse_wol_target(broadcast: &str) -> Result<Ipv4Addr, String> {
+    let address: Ipv4Addr = broadcast
+        .trim()
+        .parse()
+        .map_err(|_| "wake address must be an IPv4 address such as 192.168.1.255".to_string())?;
+
+    if address.is_broadcast() || address.is_private() || address.is_link_local() {
+        Ok(address)
+    } else {
+        Err("wake address must be on your local network (for example 192.168.1.255)".to_string())
+    }
 }
 
 fn interface_to_primary_info(
@@ -521,7 +541,7 @@ fn logoff() -> Result<&'static str, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_mac;
+    use super::{parse_mac, parse_wol_target};
 
     #[cfg(target_os = "windows")]
     use super::startup_command;
@@ -538,6 +558,41 @@ mod tests {
     fn rejects_invalid_mac() {
         let parsed = parse_mac("invalid");
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn wol_target_accepts_local_network_addresses() {
+        for address in [
+            "255.255.255.255",
+            "192.168.1.255",
+            "10.0.0.42",
+            "172.16.5.255",
+            "169.254.1.1",
+            " 192.168.0.255 ",
+        ] {
+            assert!(
+                parse_wol_target(address).is_ok(),
+                "{address} should be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn wol_target_rejects_hostnames_public_and_loopback_addresses() {
+        for address in [
+            "example.com",
+            "localhost",
+            "8.8.8.8",
+            "127.0.0.1",
+            "224.0.0.1",
+            "::1",
+            "",
+        ] {
+            assert!(
+                parse_wol_target(address).is_err(),
+                "{address} should be rejected"
+            );
+        }
     }
 
     #[cfg(target_os = "windows")]

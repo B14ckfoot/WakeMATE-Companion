@@ -7,7 +7,9 @@
 //! credential store the way the shared QR token does.
 
 use std::{
-    fs, io,
+    fs,
+    fs::OpenOptions,
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -179,8 +181,16 @@ impl DeviceRegistry {
         tmp_name.push(format!(".{}.tmp", Uuid::new_v4()));
         let tmp_path = path.with_file_name(tmp_name);
 
+        // Flush before the rename so a power loss right after it cannot leave
+        // an empty file, which would load as "no paired devices".
         let write_result = (|| -> io::Result<()> {
-            fs::write(&tmp_path, json.as_bytes())?;
+            let mut tmp_file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
+            tmp_file.write_all(json.as_bytes())?;
+            tmp_file.sync_all()?;
+            drop(tmp_file);
             fs::rename(&tmp_path, path)
         })();
 

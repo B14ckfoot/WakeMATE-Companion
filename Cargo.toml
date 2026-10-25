@@ -33,3 +33,9 @@ softbuffer = "0.4"
 tray-icon = "0.22"
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 winit = "0.30"
+
+[profile.release]
+# One codegen unit plus link-time optimization trades a slower release build
+# for a smaller, faster tray binary. Debug builds are unaffected.
+lto = true
+codegen-units = 1

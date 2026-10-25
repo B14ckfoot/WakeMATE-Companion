@@ -469,10 +469,53 @@ pub fn open_path(path: &Path) -> Result<(), String> {
     }
 }
 
+/// Delay before suspending, so the HTTP response reaches the phone first.
+/// Suspending inside the request would hold the reply until the PC wakes,
+/// and the phone would report a timeout for a sleep that worked.
+#[cfg(target_os = "windows")]
+const SLEEP_RESPONSE_GRACE: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Calls `SetSuspendState` directly. The previous `rundll32
+/// powrprof.dll,SetSuspendState 0,1,0` form does not pass those arguments the
+/// way it reads: rundll32's window handle lands in `bHibernate`, so any PC
+/// with hibernation enabled hibernated instead of sleeping, which many network
+/// adapters cannot be woken from.
 #[cfg(target_os = "windows")]
 fn sleep() -> Result<&'static str, String> {
-    run("rundll32.exe", &["powrprof.dll,SetSuspendState", "0,1,0"])?;
-    Ok("sleep command sent")
+    use windows_sys::Win32::System::Power::{
+        GetPwrCapabilities, SetSuspendState, SYSTEM_POWER_CAPABILITIES,
+    };
+
+    let mut capabilities: SYSTEM_POWER_CAPABILITIES = unsafe { std::mem::zeroed() };
+    let known = unsafe { GetPwrCapabilities(&mut capabilities) } != 0;
+
+    let (hibernate, message) = if !known || capabilities.SystemS3 != 0 {
+        (0, "sleep command sent")
+    } else if capabilities.SystemS4 != 0 && capabilities.HiberFilePresent != 0 {
+        // Modern Standby PCs have no S3 sleep that an app can request;
+        // hibernating is what Windows offers, so say so instead of "sleep".
+        (
+            1,
+            "this PC cannot sleep on request, so it is hibernating instead",
+        )
+    } else {
+        return Err(
+            "Windows reports that this PC cannot sleep or hibernate on request".to_string(),
+        );
+    };
+
+    std::thread::spawn(move || {
+        std::thread::sleep(SLEEP_RESPONSE_GRACE);
+        if unsafe { SetSuspendState(hibernate, 0, 0) } == 0 {
+            tracing::warn!(
+                error = %std::io::Error::last_os_error(),
+                hibernate = hibernate != 0,
+                "Windows refused the suspend request"
+            );
+        }
+    });
+
+    Ok(message)
 }
 
 #[cfg(target_os = "macos")]

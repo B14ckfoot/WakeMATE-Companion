@@ -1,247 +1,430 @@
-use enigo::{Enigo, Key, KeyboardControllable, MouseButton, MouseControllable};
+//! Validated commands and checked OS input. Only `input_executor` emits events.
 
 use crate::types::{MediaAction, MouseButtonAction, MouseButtonArg, ScrollDirection};
+use std::fmt;
 
-#[derive(Default)]
-pub struct InputController;
+pub const MAX_TEXT_CHARS: usize = 1024;
+pub const MAX_MOUSE_DELTA: i32 = 2048;
 
-impl InputController {
-    pub fn mouse_move_relative(&self, delta_x: i32, delta_y: i32) -> Result<(), String> {
-        let mut enigo = Enigo::new();
-        enigo.mouse_move_relative(delta_x, delta_y);
-        Ok(())
-    }
+#[derive(Debug)]
+pub enum InputError {
+    Invalid(String),
+    Busy,
+    Cancelled,
+    Denied,
+    Unsupported(String),
+    Execution(String),
+    Unavailable,
+}
 
-    pub fn mouse_click(&self, button: MouseButtonArg, double: bool) -> Result<(), String> {
-        let mut enigo = Enigo::new();
-        let button = map_mouse_button(button);
-
-        enigo.mouse_click(button);
-        if double {
-            enigo.mouse_click(button);
+impl fmt::Display for InputError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(s) | Self::Unsupported(s) | Self::Execution(s) => f.write_str(s),
+            Self::Busy => f.write_str("remote input is busy; retry shortly"),
+            Self::Cancelled => f.write_str("remote input was cancelled"),
+            Self::Denied => f.write_str("this device is no longer authorized for remote input"),
+            Self::Unavailable => f.write_str("the remote input worker is unavailable"),
         }
-
-        Ok(())
     }
+}
+impl std::error::Error for InputError {}
 
-    pub fn mouse_button(
-        &self,
+#[derive(Debug)]
+pub enum InputCommand {
+    MouseMove {
+        delta_x: i32,
+        delta_y: i32,
+    },
+    MouseClick {
+        button: MouseButtonArg,
+        double: bool,
+    },
+    MouseButton {
         button: MouseButtonArg,
         action: MouseButtonAction,
-    ) -> Result<(), String> {
-        let mut enigo = Enigo::new();
-        let button = map_mouse_button(button);
+    },
+    MouseScroll {
+        direction: ScrollDirection,
+        amount: i32,
+    },
+    KeyPress {
+        key: String,
+    },
+    TextInput {
+        text: String,
+    },
+    Media {
+        action: MediaAction,
+    },
+}
 
-        match action {
-            MouseButtonAction::Down => enigo.mouse_down(button),
-            MouseButtonAction::Up => enigo.mouse_up(button),
+pub(crate) enum ValidatedInput {
+    Move(i32, i32),
+    Click(Button, bool),
+    Button(Button, bool),
+    Scroll(i32),
+    Shortcut(Shortcut),
+    Text(String),
+}
+
+impl InputCommand {
+    pub(crate) fn validate(self) -> Result<ValidatedInput, InputError> {
+        match self {
+            Self::MouseMove { delta_x, delta_y } => {
+                if delta_x.unsigned_abs() > MAX_MOUSE_DELTA as u32
+                    || delta_y.unsigned_abs() > MAX_MOUSE_DELTA as u32
+                {
+                    return Err(InputError::Invalid(format!(
+                        "mouse movement must be between -{MAX_MOUSE_DELTA} and {MAX_MOUSE_DELTA}"
+                    )));
+                }
+                Ok(ValidatedInput::Move(delta_x, delta_y))
+            }
+            Self::MouseClick { button, double } => Ok(ValidatedInput::Click(button.into(), double)),
+            Self::MouseButton { button, action } => Ok(ValidatedInput::Button(
+                button.into(),
+                matches!(action, MouseButtonAction::Down),
+            )),
+            Self::MouseScroll { direction, amount } => {
+                let magnitude = amount.unsigned_abs();
+                if !(1..=100).contains(&magnitude) {
+                    return Err(InputError::Invalid(
+                        "scroll amount must have magnitude 1 to 100".into(),
+                    ));
+                }
+                let delta = magnitude as i32;
+                Ok(ValidatedInput::Scroll(match direction {
+                    ScrollDirection::Up => delta,
+                    ScrollDirection::Down => -delta,
+                }))
+            }
+            Self::KeyPress { key } => Ok(ValidatedInput::Shortcut(parse_shortcut(&key)?)),
+            Self::TextInput { text } => {
+                if text.chars().count() > MAX_TEXT_CHARS || text.contains('\0') {
+                    return Err(InputError::Invalid(format!(
+                        "text must contain at most {MAX_TEXT_CHARS} characters and no NUL"
+                    )));
+                }
+                Ok(ValidatedInput::Text(text))
+            }
+            Self::Media { action } => {
+                let key = match action {
+                    MediaAction::PlayPause => 0xB3,
+                    MediaAction::Next => 0xB0,
+                    MediaAction::Previous => 0xB1,
+                    MediaAction::Mute => 0xAD,
+                    MediaAction::VolumeUp => 0xAF,
+                    MediaAction::VolumeDown => 0xAE,
+                };
+                Ok(ValidatedInput::Shortcut(Shortcut {
+                    modifiers: Vec::new(),
+                    key: ShortcutKey::Virtual(key),
+                }))
+            }
         }
-
-        Ok(())
-    }
-
-    pub fn mouse_scroll(&self, direction: ScrollDirection, amount: i32) -> Result<(), String> {
-        let mut enigo = Enigo::new();
-        let amount = amount.abs().max(1);
-        let signed_amount = match direction {
-            ScrollDirection::Up => amount,
-            ScrollDirection::Down => -amount,
-        };
-
-        enigo.mouse_scroll_y(signed_amount);
-        Ok(())
-    }
-
-    pub fn key_press(&self, key: &str) -> Result<(), String> {
-        let mut enigo = Enigo::new();
-
-        if key.contains('+') {
-            let parts: Vec<&str> = key
-                .split('+')
-                .map(str::trim)
-                .filter(|part| !part.is_empty())
-                .collect();
-
-            if parts.is_empty() {
-                return Err("key combination is empty".to_string());
-            }
-
-            if is_secure_attention_combo(&parts) {
-                return Err(SECURE_ATTENTION_REJECTION.to_string());
-            }
-
-            for modifier in parts.iter().take(parts.len().saturating_sub(1)) {
-                let parsed = parse_key(modifier)
-                    .ok_or_else(|| format!("unsupported modifier: {modifier}"))?;
-                enigo.key_down(parsed);
-            }
-
-            let last = parts.last().copied().unwrap_or_default();
-            let parsed = parse_key(last).ok_or_else(|| format!("unsupported key: {last}"))?;
-            enigo.key_click(parsed);
-
-            for modifier in parts.iter().take(parts.len().saturating_sub(1)).rev() {
-                let parsed = parse_key(modifier)
-                    .ok_or_else(|| format!("unsupported modifier: {modifier}"))?;
-                enigo.key_up(parsed);
-            }
-
-            return Ok(());
-        }
-
-        let parsed = parse_key(key).ok_or_else(|| format!("unsupported key: {key}"))?;
-        enigo.key_click(parsed);
-        Ok(())
-    }
-
-    pub fn text_input(&self, text: &str) -> Result<(), String> {
-        let mut enigo = Enigo::new();
-        enigo.key_sequence(text);
-        Ok(())
-    }
-
-    pub fn media_action(&self, action: MediaAction) -> Result<(), String> {
-        let key_name = match action {
-            MediaAction::PlayPause => "playpause",
-            MediaAction::Next => "nexttrack",
-            MediaAction::Previous => "prevtrack",
-            MediaAction::Mute => "mute",
-            MediaAction::VolumeUp => "volumeup",
-            MediaAction::VolumeDown => "volumedown",
-        };
-
-        self.key_press(key_name)
     }
 }
 
-/// Sent back when a caller tries to type the Secure Attention Sequence.
-/// Names the supported command so an older phone build gets a usable message
-/// rather than a dead end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Button {
+    Left,
+    Right,
+    Middle,
+}
+impl From<MouseButtonArg> for Button {
+    fn from(value: MouseButtonArg) -> Self {
+        match value {
+            MouseButtonArg::Left => Self::Left,
+            MouseButtonArg::Right => Self::Right,
+            MouseButtonArg::Middle => Self::Middle,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum InputKey {
+    Virtual(u16),
+    Unicode(u16),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputEvent {
+    Move(i32, i32),
+    Button(Button, bool),
+    Scroll(i32),
+    Key(InputKey, bool),
+}
+
+pub(crate) struct Shortcut {
+    modifiers: Vec<u16>,
+    key: ShortcutKey,
+}
+enum ShortcutKey {
+    Virtual(u16),
+    Character(char),
+}
+
+/// Preserve the accepted prefix on partial insertion for accurate cleanup.
+pub(crate) struct BackendFailure {
+    pub accepted: usize,
+    pub detail: String,
+}
+pub(crate) trait InputBackend: Send {
+    fn is_supported(&self) -> bool {
+        true
+    }
+    /// Refuse a batch that would borrow/release a key or button already held
+    /// locally. This is a best-effort check; the OS may receive local input
+    /// immediately after the snapshot.
+    fn local_input_busy(&mut self, _: &[InputEvent], _: &[Button], _: &[InputKey]) -> bool {
+        false
+    }
+    fn send(&mut self, events: &[InputEvent]) -> Result<(), BackendFailure>;
+    fn character_key(&mut self, character: char) -> Result<(u16, Vec<u16>), InputError>;
+}
+
+pub(crate) fn shortcut_events(
+    shortcut: &Shortcut,
+    backend: &mut dyn InputBackend,
+) -> Result<Vec<InputEvent>, InputError> {
+    let (key, implied) = match shortcut.key {
+        ShortcutKey::Virtual(key) => (key, Vec::new()),
+        ShortcutKey::Character(c) => backend.character_key(c)?,
+    };
+    let mut modifiers = shortcut.modifiers.clone();
+    for modifier in implied {
+        if !modifiers.contains(&modifier) {
+            modifiers.push(modifier);
+        }
+    }
+    let mut events = Vec::with_capacity(modifiers.len() * 2 + 2);
+    for modifier in &modifiers {
+        events.push(InputEvent::Key(InputKey::Virtual(*modifier), true));
+    }
+    events.push(InputEvent::Key(InputKey::Virtual(key), true));
+    events.push(InputEvent::Key(InputKey::Virtual(key), false));
+    for modifier in modifiers.iter().rev() {
+        events.push(InputEvent::Key(InputKey::Virtual(*modifier), false));
+    }
+    Ok(events)
+}
+
 pub const SECURE_ATTENTION_REJECTION: &str =
     "Ctrl+Alt+Delete cannot be sent as keystrokes; use the security_screen command instead";
 
-/// True for Ctrl+Alt+Delete in any order or spelling.
-///
-/// Windows claims the real sequence in kernel mode and filters synthetic
-/// input out of it, so pressing these three through `SendInput` never reaches
-/// winlogon. What it *does* do is deliver a bare Delete to whatever window
-/// has focus while Ctrl and Alt are held -- destroying a selection, a file, or
-/// a row of a table with no way to tell the user it happened. Refusing is
-/// both the honest answer and the safe one; [`crate::secure_attention`]
-/// explains the sanctioned alternative.
-fn is_secure_attention_combo(parts: &[&str]) -> bool {
-    if parts.len() != 3 {
-        return false;
+fn parse_shortcut(value: &str) -> Result<Shortcut, InputError> {
+    if value.is_empty() || value.len() > 128 {
+        return Err(InputError::Invalid(
+            "key combination is empty or too long".into(),
+        ));
     }
-
-    let mut has_control = false;
-    let mut has_alt = false;
-    let mut has_delete = false;
-
-    for part in parts {
-        match part.trim().to_ascii_lowercase().as_str() {
-            "ctrl" | "control" => has_control = true,
-            "alt" => has_alt = true,
-            "delete" | "del" => has_delete = true,
-            _ => return false,
+    let parts: Vec<_> = if value == "+" {
+        vec![value]
+    } else {
+        value.split('+').map(str::trim).collect()
+    };
+    if parts.len() > 5 || parts.iter().any(|part| part.is_empty()) {
+        return Err(InputError::Invalid("invalid key combination".into()));
+    }
+    let (last, prefixes) = parts
+        .split_last()
+        .ok_or_else(|| InputError::Invalid("key combination is empty".into()))?;
+    let mut modifiers = Vec::new();
+    for part in prefixes {
+        let modifier = modifier_key(part).ok_or_else(|| {
+            InputError::Invalid("only modifiers may precede the final shortcut key".into())
+        })?;
+        if modifiers.contains(&modifier) {
+            return Err(InputError::Invalid("duplicate shortcut modifier".into()));
         }
+        modifiers.push(modifier);
     }
-
-    has_control && has_alt && has_delete
+    let key = named_key(last)
+        .map(ShortcutKey::Virtual)
+        .or_else(|| {
+            let mut chars = last.chars();
+            let c = chars.next()?;
+            (chars.next().is_none() && !c.is_control()).then_some(ShortcutKey::Character(c))
+        })
+        .ok_or_else(|| InputError::Invalid("unsupported shortcut key".into()))?;
+    if matches!(key, ShortcutKey::Virtual(0x2E))
+        && modifiers.contains(&0x11)
+        && modifiers.contains(&0x12)
+    {
+        return Err(InputError::Invalid(SECURE_ATTENTION_REJECTION.into()));
+    }
+    if !modifiers.is_empty() && modifier_key(last).is_some() {
+        return Err(InputError::Invalid(
+            "shortcut requires a final non-modifier key".into(),
+        ));
+    }
+    Ok(Shortcut { modifiers, key })
 }
 
-fn map_mouse_button(button: MouseButtonArg) -> MouseButton {
-    match button {
-        MouseButtonArg::Left => MouseButton::Left,
-        MouseButtonArg::Right => MouseButton::Right,
-        MouseButtonArg::Middle => MouseButton::Middle,
-    }
-}
-
-fn parse_key(raw: &str) -> Option<Key> {
-    let key = raw.trim().to_ascii_lowercase();
-
-    match key.as_str() {
-        "enter" | "return" => Some(Key::Return),
-        "tab" => Some(Key::Tab),
-        "space" => Some(Key::Space),
-        "backspace" => Some(Key::Backspace),
-        "delete" | "del" => Some(Key::Delete),
-        "escape" | "esc" => Some(Key::Escape),
-        "up" | "uparrow" => Some(Key::UpArrow),
-        "down" | "downarrow" => Some(Key::DownArrow),
-        "left" | "leftarrow" => Some(Key::LeftArrow),
-        "right" | "rightarrow" => Some(Key::RightArrow),
-        "home" => Some(Key::Home),
-        "end" => Some(Key::End),
-        "pageup" => Some(Key::PageUp),
-        "pagedown" => Some(Key::PageDown),
-        "shift" => Some(Key::Shift),
-        "ctrl" | "control" => Some(Key::Control),
-        "alt" => Some(Key::Alt),
-        "meta" | "win" | "command" | "cmd" | "super" => Some(Key::Meta),
-        "f1" => Some(Key::F1),
-        "f2" => Some(Key::F2),
-        "f3" => Some(Key::F3),
-        "f4" => Some(Key::F4),
-        "f5" => Some(Key::F5),
-        "f6" => Some(Key::F6),
-        "f7" => Some(Key::F7),
-        "f8" => Some(Key::F8),
-        "f9" => Some(Key::F9),
-        "f10" => Some(Key::F10),
-        "f11" => Some(Key::F11),
-        "f12" => Some(Key::F12),
-        "volumeup" => Some(Key::VolumeUp),
-        "volumedown" => Some(Key::VolumeDown),
-        "mute" | "volumemute" => Some(Key::VolumeMute),
-        // enigo only defines the transport keys on Windows and Linux, so
-        // these arms have to carry the same gate or the crate stops compiling
-        // on a macOS dev machine -- which is where the tests get run.
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
-        "playpause" | "mediaplaypause" => Some(Key::MediaPlayPause),
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
-        "nexttrack" | "medianexttrack" => Some(Key::MediaNextTrack),
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
-        "prevtrack" | "previoustrack" | "mediaprevtrack" => Some(Key::MediaPrevTrack),
-        _ if key.chars().count() == 1 => Some(Key::Layout(key.chars().next()?)),
+fn modifier_key(value: &str) -> Option<u16> {
+    match value.to_ascii_lowercase().as_str() {
+        "shift" => Some(0x10),
+        "ctrl" | "control" => Some(0x11),
+        "alt" => Some(0x12),
+        "meta" | "win" | "command" | "cmd" | "super" => Some(0x5B),
         _ => None,
+    }
+}
+fn named_key(value: &str) -> Option<u16> {
+    let value = value.to_ascii_lowercase();
+    if let Some(key) = modifier_key(&value) {
+        return Some(key);
+    }
+    match value.as_str() {
+        "enter" | "return" => Some(0x0D),
+        "tab" => Some(0x09),
+        "space" => Some(0x20),
+        "backspace" => Some(0x08),
+        "delete" | "del" => Some(0x2E),
+        "escape" | "esc" => Some(0x1B),
+        "up" | "uparrow" => Some(0x26),
+        "down" | "downarrow" => Some(0x28),
+        "left" | "leftarrow" => Some(0x25),
+        "right" | "rightarrow" => Some(0x27),
+        "home" => Some(0x24),
+        "end" => Some(0x23),
+        "pageup" => Some(0x21),
+        "pagedown" => Some(0x22),
+        "volumeup" => Some(0xAF),
+        "volumedown" => Some(0xAE),
+        "mute" | "volumemute" => Some(0xAD),
+        "playpause" | "mediaplaypause" => Some(0xB3),
+        "nexttrack" | "medianexttrack" => Some(0xB0),
+        "prevtrack" | "previoustrack" | "mediaprevtrack" => Some(0xB1),
+        _ => value
+            .strip_prefix('f')
+            .and_then(|n| n.parse::<u16>().ok())
+            .filter(|n| (1..=12).contains(n))
+            .map(|n| 0x70 + n - 1),
+    }
+}
+
+#[cfg(all(target_os = "windows", not(test)))]
+#[path = "windows_input.rs"]
+mod windows_backend;
+#[cfg(all(target_os = "windows", not(test)))]
+pub(crate) fn platform_backend() -> Box<dyn InputBackend> {
+    Box::new(windows_backend::WindowsInput)
+}
+#[cfg(all(not(target_os = "windows"), not(test)))]
+pub(crate) fn platform_backend() -> Box<dyn InputBackend> {
+    Box::new(UnsupportedInput)
+}
+#[cfg(all(not(target_os = "windows"), not(test)))]
+struct UnsupportedInput;
+#[cfg(all(not(target_os = "windows"), not(test)))]
+impl InputBackend for UnsupportedInput {
+    fn is_supported(&self) -> bool {
+        false
+    }
+    fn send(&mut self, _: &[InputEvent]) -> Result<(), BackendFailure> {
+        Err(BackendFailure {
+            accepted: 0,
+            detail: "remote input is supported only by the Windows companion".into(),
+        })
+    }
+    fn character_key(&mut self, _: char) -> Result<(u16, Vec<u16>), InputError> {
+        Err(InputError::Unsupported(
+            "remote input is supported only by the Windows companion".into(),
+        ))
+    }
+}
+
+// Router tests must never type, move the mouse, or change real input state.
+#[cfg(test)]
+pub(crate) fn platform_backend() -> Box<dyn InputBackend> {
+    Box::new(TestInput)
+}
+#[cfg(test)]
+struct TestInput;
+#[cfg(test)]
+impl InputBackend for TestInput {
+    fn send(&mut self, _: &[InputEvent]) -> Result<(), BackendFailure> {
+        Ok(())
+    }
+    fn character_key(&mut self, character: char) -> Result<(u16, Vec<u16>), InputError> {
+        if character.is_ascii_alphabetic() {
+            Ok((character.to_ascii_uppercase() as u16, Vec::new()))
+        } else {
+            Err(InputError::Unsupported(
+                "test layout does not map this shortcut".into(),
+            ))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_secure_attention_combo;
-
+    use super::*;
     #[test]
-    fn detects_the_secure_attention_sequence_in_any_spelling_or_order() {
-        for combo in [
-            vec!["ctrl", "alt", "delete"],
-            vec!["control", "alt", "del"],
-            vec!["CTRL", "Alt", "Delete"],
-            vec!["delete", "ctrl", "alt"],
-            vec!["alt", "delete", "control"],
+    fn validates_commands_before_creating_os_events() {
+        for key in [
+            "",
+            "ctrl+bad-key",
+            "ctrl++c",
+            "a+b",
+            "ctrl+ctrl+c",
+            "ctrl+alt+delete",
+            "ctrl+alt+shift+delete",
+            "ctrl+alt",
         ] {
-            assert!(
-                is_secure_attention_combo(&combo),
-                "{combo:?} is Ctrl+Alt+Delete and must be refused"
-            );
+            assert!(parse_shortcut(key).is_err(), "{key}");
         }
+        for key in ["+", "ctrl+shift+c", "F12", "win+left", "é", "enter"] {
+            assert!(parse_shortcut(key).is_ok(), "{key}");
+        }
+        assert!(InputCommand::MouseMove {
+            delta_x: i32::MIN,
+            delta_y: 0
+        }
+        .validate()
+        .is_err());
+        assert!(InputCommand::TextInput {
+            text: "a".repeat(MAX_TEXT_CHARS + 1)
+        }
+        .validate()
+        .is_err());
+        assert!(InputCommand::TextInput {
+            text: "a\0b".into()
+        }
+        .validate()
+        .is_err());
+        assert!(InputCommand::TextInput {
+            text: "😀".repeat(MAX_TEXT_CHARS)
+        }
+        .validate()
+        .is_ok());
     }
-
     #[test]
-    fn leaves_ordinary_shortcuts_alone() {
-        for combo in [
-            vec!["ctrl", "c"],
-            vec!["ctrl", "alt", "t"],
-            vec!["ctrl", "shift", "delete"],
-            vec!["alt", "delete"],
-            vec!["ctrl", "alt", "shift", "delete"],
-        ] {
-            assert!(
-                !is_secure_attention_combo(&combo),
-                "{combo:?} is a normal shortcut and must still be sent"
-            );
+    fn scroll_bounds_reject_extremes_instead_of_overflowing() {
+        for amount in [i32::MIN, i32::MAX, 0, 101, -101] {
+            assert!(InputCommand::MouseScroll {
+                direction: ScrollDirection::Up,
+                amount
+            }
+            .validate()
+            .is_err());
         }
+        assert!(matches!(
+            InputCommand::MouseScroll {
+                direction: ScrollDirection::Up,
+                amount: -3
+            }
+            .validate(),
+            Ok(ValidatedInput::Scroll(3))
+        ));
+        assert!(matches!(
+            InputCommand::MouseScroll {
+                direction: ScrollDirection::Down,
+                amount: 3
+            }
+            .validate(),
+            Ok(ValidatedInput::Scroll(-3))
+        ));
     }
 }

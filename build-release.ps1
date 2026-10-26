@@ -1,5 +1,6 @@
 param(
-    [switch]$NoOneCoreFallback
+    [switch]$NoOneCoreFallback,
+    [switch]$EnvironmentOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -253,6 +254,22 @@ function Sync-ReleaseAssets {
         -DestinationPath (Join-Path $releaseDir 'app-icon.ico')
 }
 
+function Get-ReleaseSourceSnapshot {
+    param([Parameter(Mandatory = $true)][string]$Root)
+
+    $files = @('Cargo.toml', 'Cargo.lock', 'build.rs') | ForEach-Object { Join-Path $Root $_ }
+    foreach ($directory in @('src', 'assets')) {
+        $files += Get-ChildItem -LiteralPath (Join-Path $Root $directory) -File -Recurse |
+            Select-Object -ExpandProperty FullName
+    }
+    @($files | Sort-Object -Unique | ForEach-Object {
+        [ordered]@{
+            path = $_.Substring($Root.Length + 1).Replace('\', '/')
+            sha256 = (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+    })
+}
+
 $repoRoot = $PSScriptRoot
 $releaseExe = Join-Path $repoRoot 'target\release\wakemate-companion.exe'
 
@@ -291,13 +308,48 @@ try {
         throw "msvcrt.lib is still unavailable. Repair the Visual Studio C++ x64 desktop libraries and re-run this script."
     }
 
-    & cargo build --release
+    if ($EnvironmentOnly) { return }
+
+    $sourceBefore = @(Get-ReleaseSourceSnapshot -Root $repoRoot)
+    & cargo build --release --locked
 
     if ($LASTEXITCODE -ne 0) {
         throw "cargo build --release failed with exit code $LASTEXITCODE."
     }
 
     Sync-ReleaseAssets -RepoRoot $repoRoot
+    $sourceAfter = @(Get-ReleaseSourceSnapshot -Root $repoRoot)
+    if ((ConvertTo-Json -InputObject $sourceBefore -Depth 4 -Compress) -ne
+        (ConvertTo-Json -InputObject $sourceAfter -Depth 4 -Compress)) {
+        throw 'Sources changed during the release build. Re-run after source edits finish; no build provenance was published.'
+    }
+    $metadataText = & cargo metadata --no-deps --locked --format-version 1
+    if ($LASTEXITCODE -ne 0) { throw 'Could not read locked Cargo metadata.' }
+    $metadata = $metadataText | ConvertFrom-Json
+    $package = @($metadata.packages | Where-Object name -eq 'wakemate-companion')[0]
+    $expectedVersion = "$($package.version).0"
+    $binaryInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($releaseExe)
+    $binaryVersion = "$($binaryInfo.FileMajorPart).$($binaryInfo.FileMinorPart).$($binaryInfo.FileBuildPart).$($binaryInfo.FilePrivatePart)"
+    if ($binaryVersion -ne $expectedVersion) {
+        throw "Release executable version '$binaryVersion' does not match '$expectedVersion'."
+    }
+    $revision = (& git rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the source revision.' }
+    $dirty = [bool](& git status --porcelain)
+    if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the source worktree.' }
+    $provenance = [ordered]@{
+        schema_version = 1
+        package = 'wakemate-companion'
+        version = $package.version
+        target = 'x86_64-pc-windows-msvc'
+        built_at_utc = [DateTime]::UtcNow.ToString('o')
+        git_revision = $revision
+        worktree_dirty = $dirty
+        executable_sha256 = (Get-FileHash -LiteralPath $releaseExe -Algorithm SHA256).Hash.ToLowerInvariant()
+        source_files = $sourceAfter
+    }
+    $provenance | ConvertTo-Json -Depth 6 |
+        Set-Content -LiteralPath (Join-Path $repoRoot 'target\release\wakemate-companion.build.json') -Encoding UTF8
     Write-Host 'Release build completed:' $releaseExe
 } finally {
     Pop-Location

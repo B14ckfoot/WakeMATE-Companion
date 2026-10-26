@@ -1,83 +1,108 @@
-use tokio::net::UdpSocket;
-use tracing::{error, warn};
-
 use crate::{
     config::SharedConfig,
-    system,
     types::{DiscoveryResponse, PROTOCOL_VERSION},
 };
+use std::{
+    collections::HashMap,
+    io,
+    net::IpAddr,
+    time::{Duration, Instant},
+};
+use tokio::net::UdpSocket;
 
-pub async fn run(config: SharedConfig, tls_fingerprint: String) {
-    let initial = match config.lock() {
-        Ok(guard) => guard.clone(),
-        Err(_) => {
-            error!("failed to access config before starting discovery responder");
-            return;
-        }
-    };
+pub async fn bind(config: &SharedConfig) -> io::Result<UdpSocket> {
+    let port = config
+        .lock()
+        .map_err(|_| io::Error::other("Configuration unavailable"))?
+        .discovery_port;
+    UdpSocket::bind(("0.0.0.0", port)).await
+}
 
-    let socket = match UdpSocket::bind(("0.0.0.0", initial.discovery_port)).await {
-        Ok(socket) => socket,
-        Err(error) => {
-            error!(%error, port = initial.discovery_port, "failed to bind discovery socket");
-            return;
-        }
-    };
-
-    let mut buffer = [0_u8; 1024];
-
+pub async fn run(config: SharedConfig, fingerprint: String, socket: UdpSocket) -> io::Result<()> {
+    let mut buffer = [0u8; 1024];
+    let mut budget = DiscoveryBudget::default();
     loop {
-        let (len, peer) = match socket.recv_from(&mut buffer).await {
-            Ok(result) => result,
-            Err(error) => {
-                warn!(%error, "failed to receive discovery packet");
-                continue;
-            }
-        };
-
-        let snapshot = match config.lock() {
-            Ok(guard) => guard.clone(),
-            Err(_) => {
-                warn!("failed to access config during discovery request");
-                continue;
-            }
-        };
-
-        if !snapshot.discovery_enabled() {
+        let (len, peer) = socket.recv_from(&mut buffer).await?;
+        let snapshot = config
+            .lock()
+            .map_err(|_| io::Error::other("Configuration unavailable"))?
+            .clone();
+        if !snapshot.discovery_enabled()
+            || std::str::from_utf8(&buffer[..len]).ok().map(str::trim)
+                != Some(snapshot.discovery_message.as_str())
+        {
             continue;
         }
-
-        let message = String::from_utf8_lossy(&buffer[..len]).trim().to_string();
-        if message != snapshot.discovery_message {
+        let Some(network) = crate::network::for_peer(peer.ip()) else {
+            continue;
+        };
+        if snapshot
+            .preferred_address
+            .as_ref()
+            .is_some_and(|ip| *ip != network.local_ip)
+        {
             continue;
         }
-
-        let network = system::primary_network_info();
-        let api_port = snapshot.bind_port();
+        if !budget.admit(peer.ip(), Instant::now()) {
+            continue;
+        }
         let response = DiscoveryResponse {
-            device_name: snapshot.device_name,
-            local_ip: network
-                .as_ref()
-                .map(|info| info.local_ip.clone())
-                .unwrap_or_else(|| system::local_ipv4().unwrap_or_else(|| "127.0.0.1".to_string())),
-            mac_address: network.as_ref().and_then(|info| info.mac_address.clone()),
-            api_port,
+            device_name: snapshot.device_name.clone(),
+            local_ip: network.local_ip,
+            // MAC is delivered through the visual QR / authenticated info.
+            mac_address: None,
+            api_port: snapshot.bind_port(),
             tls_port: snapshot.tls_port,
-            fp: tls_fingerprint.clone(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            fp: fingerprint.clone(),
+            version: env!("CARGO_PKG_VERSION").into(),
             protocol_version: PROTOCOL_VERSION,
         };
+        let payload = serde_json::to_vec(&response).map_err(io::Error::other)?;
+        socket.send_to(&payload, peer).await?;
+    }
+}
 
-        let payload = match serde_json::to_vec(&response) {
-            Ok(payload) => payload,
-            Err(error) => {
-                warn!(%error, "failed to serialize discovery response");
-                continue;
-            }
-        };
-
-        if let Err(error) = socket.send_to(&payload, peer).await {
-            warn!(%error, ?peer, "failed to send discovery response");
+#[derive(Default)]
+struct DiscoveryBudget {
+    peers: HashMap<IpAddr, (Instant, u32)>,
+    total: Option<(Instant, u32)>,
+}
+impl DiscoveryBudget {
+    fn admit(&mut self, peer: IpAddr, now: Instant) -> bool {
+        self.peers
+            .retain(|_, (at, _)| now.duration_since(*at) < Duration::from_secs(1));
+        let total = self.total.get_or_insert((now, 0));
+        if now.duration_since(total.0) >= Duration::from_secs(1) {
+            *total = (now, 0);
         }
+        if total.1 >= 100 || (self.peers.len() >= 256 && !self.peers.contains_key(&peer)) {
+            return false;
+        }
+        let entry = self.peers.entry(peer).or_insert((now, 0));
+        if entry.1 >= 10 {
+            return false;
+        }
+        entry.1 += 1;
+        total.1 += 1;
+        true
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn discovery_limits_each_peer_and_recovers_after_window() {
+        let mut budget = DiscoveryBudget::default();
+        let peer = "10.0.0.50".parse().unwrap();
+        let now = Instant::now();
+        for _ in 0..10 {
+            assert!(budget.admit(peer, now));
+        }
+        assert!(!budget.admit(peer, now));
+        assert!(budget.admit(peer, now + Duration::from_secs(2)));
+        for host in 1..=100u8 {
+            budget.admit(IpAddr::from([10, 0, 1, host]), now + Duration::from_secs(2));
+        }
+        assert!(!budget.admit("10.0.2.1".parse().unwrap(), now + Duration::from_secs(2)));
     }
 }

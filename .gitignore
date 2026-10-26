@@ -5,3 +5,9 @@
 /.DS_Store
 /installer/redist/innosetup-*.exe
 *.log
+wakemate.tls.json
+wakemate.devices.json
+wakemate.config.json.*
+*.pfx
+*.key
+.env

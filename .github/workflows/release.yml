@@ -14,6 +14,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   windows:
     name: Build Windows artifact
@@ -23,6 +26,20 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Format and lint
+        run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --release --all-targets --locked -- -D warnings
+
+      - name: Audit locked dependencies
+        run: |
+          cargo install cargo-audit --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo audit
 
       - name: Verify tag matches Cargo and installer versions
         shell: pwsh
@@ -57,26 +74,16 @@ jobs:
           choco install innosetup --no-progress -y
 
       - name: Build installer
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\build-installer.ps1 -SkipPrereqCheck
-
-      - name: Checksum
-        shell: pwsh
-        run: |
-          $installers = @(Get-ChildItem "dist\installer\WakeMATE-Companion-Setup-v*.exe")
-          if ($installers.Count -ne 1) {
-            throw "Expected exactly one versioned WakeMATE installer, found $($installers.Count)."
-          }
-          $installer = $installers[0]
-          Get-FileHash $installer.FullName -Algorithm SHA256 |
-            ForEach-Object { "$($_.Hash)  $($installer.Name)" } |
-            Out-File -Encoding ascii "$($installer.FullName).sha256"
+        id: installer
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\build-installer.ps1 -UseVerifiedBuild
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows-installer
           path: |
-            dist/installer/WakeMATE-Companion-Setup-v*.exe
-            dist/installer/WakeMATE-Companion-Setup-v*.exe.sha256
+            ${{ steps.installer.outputs.installer_path }}
+            ${{ steps.installer.outputs.checksum_path }}
+            ${{ steps.installer.outputs.provenance_path }}
           if-no-files-found: error
 
   macos:
@@ -87,6 +94,15 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Format, lint, and audit
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --release --all-targets --locked -- -D warnings
+          cargo install cargo-audit --locked
+          cargo audit
 
       - name: cargo test
         run: cargo test --release --locked
@@ -95,20 +111,19 @@ jobs:
         run: cargo build --release --locked
 
       - name: Package unsigned .dmg
+        id: package
         run: |
           chmod +x installer/macos/package-macos.sh
           ./installer/macos/package-macos.sh
-
-      - name: Checksum
-        run: |
-          shasum -a 256 dist/macos/*.dmg > dist/macos/checksums.sha256
 
       - uses: actions/upload-artifact@v4
         with:
           name: macos-dmg-unsigned
           path: |
-            dist/macos/*.dmg
-            dist/macos/checksums.sha256
+            ${{ steps.package.outputs.artifact_path }}
+            ${{ steps.package.outputs.checksum_path }}
+            ${{ steps.package.outputs.provenance_path }}
+            ${{ steps.package.outputs.sources_path }}
           if-no-files-found: error
 
   draft-release:

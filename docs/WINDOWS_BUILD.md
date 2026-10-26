@@ -12,9 +12,12 @@ The helper script:
 - imports the x64 developer environment automatically
 - adds the active MSVC desktop `lib\x64` directory to `LIB` when needed
 - falls back to `lib\onecore\x64` on this machine if the standard desktop import libraries are missing
-- runs `cargo build --release`
+- runs `cargo build --release --locked`
 - stages runtime icon assets into `target\release\assets`
 - copies `assets\app-icon.ico` into `target\release\app-icon.ico`
+- verifies that source hashes stayed unchanged during the build
+- records executable version/hash, source hashes, and Git revision/dirty state
+  in `target\release\wakemate-companion.build.json`
 
 The expected output is:
 
@@ -39,3 +42,27 @@ After repair, verify all three paths exist under the same toolset and then re-ru
 - `bin\HostX64\x64\cl.exe`
 - `include\vcruntime.h`
 - `lib\x64\msvcrt.lib`
+
+The quality-check script imports the same validated MSVC environment with `build-release.ps1 -EnvironmentOnly`, so it also works from a regular PowerShell session.
+
+## Package the verified build
+
+Run the full quality gate first, then the release helper above. Package without
+launching the companion or changing installed settings:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\build-installer.ps1 -UseVerifiedBuild
+```
+
+The helper checks matching source/build provenance, versions, hashes, and the
+bundled runtime's Microsoft signature. It creates a fresh versioned directory
+under `dist/installer/`; `target/installer-latest.json` records the exact paths.
+The package includes SHA-256 and provenance sidecars. Artifacts remain unsigned
+until genuine signing is configured and verified.
+
+Setup never launches the tray under its administrator token. Close Setup and
+start the installed shortcut normally. The executable rejects elevated and
+service-session operation. Native first-run settings require private-LAN
+consent before network listeners/discovery are exposed. This source/build gate
+does not replace clean-VM installer/UAC/firewall/upgrade/uninstall or
+physical-phone verification.

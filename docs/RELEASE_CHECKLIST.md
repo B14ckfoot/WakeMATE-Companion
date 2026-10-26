@@ -1,91 +1,54 @@
-# WakeMATE Release Checklist
+# WakeMATE 0.3 release checklist
 
-This checklist is for shipping a public Windows download. It is not legal advice.
+A green source/build gate is necessary but does not validate installation or physical devices. Record the source revision, build/provenance files, test results, and remaining boundaries for the exact artifact being reviewed. Historical audits are not current release evidence.
 
-## Product Identity
+## Source and protocol gates
 
-- Choose the final publisher name shown in Windows installer and code-signing metadata.
-- Choose the final product version.
-- Choose a support email and website URL.
-- Choose a software license for this repo.
-- Have qualified counsel review `docs/EULA.txt` for the intended release jurisdictions.
-- Replace all placeholder text in the privacy policy, third-party notices, and installer files.
+- [ ] Cargo, installer, release metadata, artifact names, and tag agree on the version; wire protocol is 5 and pairing QR contract remains 3.
+- [ ] Windows format, Clippy, tests, release build, and dependency audit pass with the locked dependency set and validated MSVC environment.
+- [ ] Mobile lint, TypeScript, full Jest, and generated iOS invariant checks pass against this companion contract.
+- [ ] No permanent shared token/keyring runtime or global input/power authorization remains. Retired JSON fields are omitted on save.
+- [ ] QR-session credentials cannot command the desktop, and approved-device credentials cannot enroll another phone. Legacy activation is rejected.
+- [ ] Missing/corrupt/unavailable mobile pins and certificate mismatch fail before credentials are sent. IP overrides retain the saved identity. HTTP supports only unauthenticated public health.
+- [ ] Each capability is checked with the phone's current durable grants. Approval with status/wake only succeeds without enabling input/power. Legacy records receive only least-privilege grants.
+- [ ] Pause, changed grants, one/all-phone revoke, reset, restart, and shutdown cancel stale queued/held input. Storage failure is surfaced and cannot report durable success.
+- [ ] Input tests cover a full bounded queue, authorization changes, held-button expiry, text limits/chunking, physical modifiers, and partial/failed `SendInput`.
+- [ ] Logs, fixtures, and artifacts contain no real tokens, QR credentials, private keys, signing material, or user-specific configuration.
 
-## Security Gates
+## Exact artifact gates
 
-- Confirm `allow_remote_connections` defaults to `false`.
-- Confirm `allow_discovery` defaults to `false`.
-- Confirm the Windows installer prepares a clean-install config that enables remote access and discovery for first-run pairing.
-- Confirm `allow_input_commands` and `allow_power_commands` default to `false`.
-- Confirm `GET /v1/info` requires `x-wakemate-token` in production builds.
-- Confirm the config file is created under the user app-data folder, not next to the `.exe`.
-- Confirm no tokens, passwords, or personal data are written to logs.
-- Confirm the pairing token is stored via the OS credential store (`token_storage: "keyring"` after first run), with the file-based fallback only engaging (and logging a warning) when the credential store is genuinely unavailable.
-- Confirm the tray `Rotate Pairing Token` action works and persists the new token.
-- Confirm `/v1/pairing/activate` does **not** grant input/power capability without an explicit "Yes" on the native desktop confirmation dialog.
-- Upgrade a machine that has the old `WakeMATE Companion Server` scheduled task and confirm Setup removes it. Verify a stale `--headless-server` launch exits without reading user state or binding HTTP/TLS.
-- Reboot to the Windows sign-in screen and confirm the phone can still send Wake-on-LAN directly, while Companion health/control correctly remains unavailable until sign-in; then sign in and confirm the normal-user tray owns HTTP/TLS, can show a pairing prompt, and accepts approved input.
-- Confirm repeated bad tokens against an authenticated endpoint trigger the per-IP lockout (429) within a few dozen requests.
-- Confirm the pairing QR is contract-v3 structured JSON with `kind: "wakemate-pairing"`, carries a fresh one-time `token`, `tls_port`, and the exact lowercase SHA-256 leaf-certificate fingerprint, omits unknown `ip`/`mac` fields, and keeps the fingerprint stable across companion restarts.
-- Confirm the current Android and iOS mobile builds reject a changed/mismatched certificate before sending the token.
-- Confirm every supported phone has upgraded and re-scanned before setting `allow_insecure_http` to `false`; do not ship a wider-than-home-LAN release with the compatibility listener enabled.
-- Confirm "Reset Companion..." clears the stored token and local settings after its own confirmation dialog, and does not claim to affect any cloud account (it can't -- there isn't one).
-- Test on a trusted LAN and on an untrusted network profile.
-- If remote access is enabled, make sure Windows Firewall prompts are understood and documented.
-- Re-read `docs/SECURITY_MODEL.md`'s "Transitional HTTP compatibility" section and verify the migration listener is disabled for any wider-than-home-LAN release.
+- [ ] Run the quality gate before packaging. Build fresh or use an existing build only with matching source/executable provenance.
+- [ ] Package into the newly generated versioned run directory; retain the installer SHA-256 and provenance JSON. Do not select an older same-version file from another `dist` directory.
+- [ ] Verify the bundled VC++ redistributable has a valid Microsoft signature. Verify prerequisite installation failures and restart requirements are reported accurately.
+- [ ] Verify a source or executable change after building makes packaging fail. Confirm new outputs preserve earlier artifacts.
+- [ ] Record whether both executable and installer are signed. Until real signing is configured and verified, label them unsigned development/review artifacts; do not bypass SmartScreen or antivirus.
+- [ ] Keep release automation in draft mode. Review the exact uploaded files before publication; do not tag/publish as part of an unrelated code change.
 
-## Packaging Gates
+## Clean Windows VM and account gates
 
-- Run `.\scripts\quality-check.ps1` (fmt, clippy `-D warnings`, tests, release build) and confirm it passes.
-- Build `.\build-release.ps1` or `cargo build --release` from a working Visual Studio Developer shell.
-- Verify the final binary path and SHA256 hash.
-- Upload the versioned Windows installer to the public download host, update
-  `WakeMate-Website/src/lib/site-config.ts` to that exact version, deploy the
-  website, and test the Companion button from a clean browser before shipping
-  the mobile build that links users there.
-- Bundle `installer\redist\VC_redist.x64.exe` if you keep using the MSVC Windows target.
-- Sign the `.exe` and installer with Authenticode.
-- Verify SmartScreen reputation behavior on a clean Windows machine.
-- Verify the installer creates Add/Remove Programs entries.
-- Verify uninstall removes installed files, shortcuts, the startup Run-key entry, and any retired pre-logon scheduled task cleanly; verify it leaves `%APPDATA%\WakeMATE Companion\` and the Credential Manager entry alone (see `docs/TROUBLESHOOTING.md`).
-- Verify updates do not overwrite user config unexpectedly.
-- macOS: see `docs/MACOS_BUILD.md` -- there is no signed/notarized artifact to gate on yet; do not ship an unsigned `.dmg` as a production release.
+- [ ] Fresh standard-user installation with administrator approval: Setup does not launch the tray or initialize the administrator's user state.
+- [ ] Normal Start-menu launch opens guided native setup. Before consent, HTTPS is loopback-only and discovery is disabled. Elevated interactive runtime is refused.
+- [ ] Select a private adapter, approve LAN access, pair by one QR scan, and exercise all four permission presets and denied actions.
+- [ ] Verify Private/LocalSubnet TCP 7778 and UDP 41234 rules for the installed program; no Public-profile or broad legacy allow rule remains. Check custom-port behavior explicitly.
+- [ ] Test pause/resume, change permissions, one/all-phone revoke, reset-to-setup, fresh invitation expiry, late prompt rejection, and restart persistence.
+- [ ] Test read-only/unwritable storage and corrupt config/registry/TLS identity. Verify fail-closed recovery and preservation of evidence.
+- [ ] Upgrade an existing installation without losing supported preferences or silently restoring broad grants. Omitted HTTP compatibility defaults false.
+- [ ] Test changed/removed adapters, VPNs/virtual adapters, multiple NICs, DHCP change, occupied HTTPS/discovery ports, and partial readiness.
+- [ ] Test Windows sign-in/sign-out, locking/unlocking, fast user switching, and two-account startup. The wrong session must never receive remote input.
+- [ ] Test graceful upgrade while running, cancellation, uninstall/reinstall, legacy scheduled-task cleanup, firewall cleanup, and startup entries for each affected Windows account. Document retained user data and inert older keyring entries.
 
-## QA Gates
+## Physical Android and iOS gates
 
-- Test first run on a clean Windows VM.
-- Test install under a standard user account.
-- Test install under an administrator account.
-- Test remote access disabled mode.
-- Test remote access enabled mode.
-- Test pairing QR flow.
-- Test token rotation.
-- Test Wake-on-LAN.
-- Test input commands.
-- Test power commands.
-- Test uninstall and reinstall.
+- [ ] Use current native builds; Expo Go and a Metro restart cannot validate certificate pinning.
+- [ ] Pair, deny, expire, re-scan, suspend/terminate/resume during approval, and recover a durably approved credential.
+- [ ] Change the certificate and confirm failure before sending a token. Change only the IP and confirm the original pin is retained.
+- [ ] Test missing/corrupt pin and locked/unavailable secure storage without HTTP fallback. Confirm public health discovery has no credential.
+- [ ] Test actual mouse/drag, keyboard/modifiers, media, allowed/denied power, queue pressure, text chunking, pause/revoke during execution, and truthful unsupported security-screen results.
+- [ ] Test direct Wake-on-LAN while the companion is offline and verify the PC actually wakes; packet dispatch alone is not proof.
 
-## Legal And Policy Gates
+## Platform and publication review
 
-- Publish a privacy policy if you collect or transmit personal data, diagnostics, account details, or identifiers beyond local device control.
-- Confirm the installer displays the approved `docs/EULA.txt` and requires acceptance before installation.
-- Clearly disclose that enabling remote access allows network control of mouse, keyboard, media, and power actions.
-- Clearly disclose that the pairing token must be kept secret.
-- Review third-party crate licenses and ship required notices.
-- If you distribute in California or otherwise meet privacy-law thresholds, confirm whether notice-at-collection and consumer-rights disclosures apply.
-
-## Recommended Files To Finalize
-
-- `README.md`
-- `docs/PRIVACY_TEMPLATE.md`
-- `docs/EULA.txt`
-- `docs/THIRD_PARTY_NOTICES_TEMPLATE.md`
-- `installer/INSTALL_WARNING.txt`
-- `installer/wakemate-companion.iss`
-
-## Current Blockers In This Workspace
-
-- No final software license has been chosen yet.
-- No production signing certificate is configured yet.
-- Privacy policy, third-party notices, and some support/release details still contain placeholders.
-- The EULA text exists but still requires qualified legal review before a public release.
+- [ ] Keep macOS labeled unsigned/non-notarized headless developer preview. Build/package success is not menu-bar, approval, permissions, startup, or real-machine parity. See [macOS notes](MACOS_BUILD.md).
+- [ ] Finalize the software license, publisher/support details, privacy policy, third-party notices, installer warning, and EULA review before a public release.
+- [ ] Explain local operation, broad signed-in-account trust for keyboard/mouse grants, retained data, and the absence of an automatic updater.
+- [ ] Publish only after the required artifact/device/account checks above have evidence. Leave unperformed checks and limitations explicit in the release notes.

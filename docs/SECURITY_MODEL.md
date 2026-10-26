@@ -1,63 +1,51 @@
-# WakeMATE Security Model
+# WakeMATE security model — protocol 5
 
-## Default State
+WakeMATE is a local-network companion for a signed-in desktop account. Network reachability never grants authorization. Windows is the production development target; platform runtime and installer claims still require real-device and clean-VM validation.
 
-- HTTPS binds to `127.0.0.1` unless `allow_remote_connections` is explicitly enabled.
-- A plaintext HTTP compatibility listener follows the same bind rule while `allow_insecure_http` is `true`. This defaults to `true` for one migration release.
-- UDP discovery is disabled unless both `allow_remote_connections` and `allow_discovery` are enabled.
-- Input and power commands are disabled by default, and even when enabled in config, still require the pairing approval described below before either flag can flip to `true` in the first place.
-- Detailed device info requires the pairing token by default.
-- The pairing token lives in the OS credential store (Windows Credential Manager; `keyring` crate) rather than a plaintext file. If the credential store is unavailable on a given machine, WakeMATE falls back to the config file and records that fact in `token_storage` so this is never silent.
+## Trust boundaries
 
-## Windows Installer Behavior
-
-- On a clean Windows install, the installer prepares the first-run config with `allow_remote_connections` and `allow_discovery` enabled so the mobile app can auto-discover the PC immediately. This is a deliberate, disclosed product tradeoff for first-run UX, not an oversight -- it widens the network attack surface (an unauthenticated UDP probe gets a device-name/IP/MAC reply) on a clean install before the user has done anything, in exchange for the mobile app being able to find the PC without manual IP entry.
-- Existing configs are preserved on reinstall or upgrade.
-- Input and power commands still stay disabled, and pairing still requires desktop approval, regardless of this installer default.
-- Per-user config, Credential Manager, and HKCU startup preparation run as the original interactive user after a normal UAC elevation. Elevated installer work is limited to machine-scoped files, prerequisites, firewall changes, and removal of the retired SYSTEM boot task.
-
-## Threat Model
-
-Considered explicitly:
-
-| Threat | Mitigation | Residual risk |
+| Boundary | Enforcement | Practical limit |
 | --- | --- | --- |
-| Attacker on the same LAN sniffing traffic | Current mobile builds use HTTPS and pin the self-signed leaf certificate's SHA-256 fingerprint from the visual QR channel | Traffic from a legacy client remains observable while the transitional HTTP listener is enabled. Disable `allow_insecure_http` after all phones have upgraded and re-scanned. |
-| Attacker who has obtained a valid token (leak, screenshot, shoulder-surf of the QR code) | The QR normally carries a fresh single-use pairing-session token with a 10-minute lifetime, enrollment still requires explicit desktop approval, and each approved phone receives its own revocable device token | A stolen approved-device token retains that device's capabilities until it is revoked from the tray. Rotating the shared pairing credential revokes every device at once. |
-| Blind token brute force | Constant-time comparison + per-IP lockout (8 failures / 60s window -> 60s lockout, shared across all authenticated endpoints) | A distributed brute force across many source IPs is not rate-limited; token entropy (a v4 UUID, ~122 bits) is the remaining defense there. |
-| A malicious website in the user's browser trying to drive the API | Auth requires a custom header (`x-wakemate-token`), which a simple cross-origin form post cannot set, and which triggers a CORS preflight for `fetch`/`XHR` that the app doesn't need to explicitly allow (no `Access-Control-Allow-Origin` is returned, so the browser blocks reading the response and, for state-changing requests, blocks the request from completing for a script that doesn't already know the token) | No Origin/Host allowlist is enforced server-side as defense in depth; recommended future work. |
-| Malicious/compromised paired phone silently enabling input/power control | `/v1/pairing/activate` now shows a native, always-on-top desktop dialog naming the requesting IP and requires an explicit "Yes" before flipping `allow_input_commands`/`allow_power_commands` | The dialog shows an IP, not a verified device identity; there is no cryptographic device-identity check. |
-| A privileged server resolving different secrets and TLS state than the signed-in user's tray | Current installers remove the retired SYSTEM/ONSTART task, and stale `--headless-server` invocations exit before reading user state or binding a listener | Companion API status/control is unavailable until the user signs in and the normal-user tray starts. Direct Wake-on-LAN from the phone remains available before sign-in. |
-| Excessive OS privilege | The running companion is the normal-user tray process; no Companion API runs as SYSTEM | The installer still needs administrator approval for Program Files, prerequisites, firewall configuration, and legacy task cleanup. |
-| Tampered/malicious update package | No auto-update mechanism exists yet | N/A today; if auto-update is added, it must verify a signature before replacing the running binary. |
-| Local file tampering / insecure local files | Config file no longer holds the token once migrated to the credential store. The persistent TLS certificate/private key identity is stored in the user's app-data folder and is created mode `0600` on Unix. A corrupt identity is rejected rather than silently replaced. | A local attacker with the same OS user account can still read/write the config, TLS identity, and any fallback plaintext token. On Windows the app-data file relies on the user's directory ACLs. |
-| Debug functionality left on in production | No `RUST_LOG=debug`/devtools-equivalent shipped enabled; tracing defaults to `info` and never logs the token itself (only its length, e.g. on rotation) | -- |
+| Network exposure | Local-only defaults; interactive onboarding consent; private adapter selection; program/port-scoped Private/LocalSubnet installer firewall rules | A trusted LAN can still contain hostile devices. Do not expose the API through public router forwarding. |
+| Computer identity | Persistent self-signed certificate; exact leaf SHA-256 pin obtained through the visual QR channel; native Android/iOS pin verification | Discovery replies, IP addresses, names, and MAC addresses are hints, not authenticated identity. |
+| Enrollment | Temporary, single-use QR session; explicit native desktop approval; selected per-phone permissions | A phone name and source IP are not cryptographically verified human identity. Approve only an expected request. |
+| Approved operations | Per-device bearer token hash, capability checks, pause/revocation state, and live checks before input execution | A stolen phone credential has its saved permissions until revoked. |
+| Desktop privilege | Normal-user process; elevated interactive runtime refused; retired pre-login mode does not bind listeners | Keyboard/mouse access gives broad signed-in-account control, even without the power grant. |
+| Browser requests | Origin-bearing API requests rejected; authenticated routes require the native token header | Native malware and software running as the same OS user are outside the browser boundary. |
+| Persistence | Versioned atomic registry snapshots for hashes, grants, pause, and generation; flushed sibling-file replacement; surfaced failures | A failed disk write cannot establish a durable grant, revoke, or pause. Repair/reset before relying on persistence. |
 
-## Transitional HTTP compatibility
+## Credentials and transport
 
-The companion now generates a persistent self-signed certificate, serves HTTPS on `tls_port` (default `7778`), and places the leaf certificate's SHA-256 fingerprint in the pairing QR. The current mobile app saves the pin in secure storage and checks the exact leaf-certificate DER digest in a native Android/iOS TLS challenge handler before sending the bearer token. QR payloads that partially advertise TLS are rejected instead of downgraded.
+There is **no permanent shared pairing credential** in protocol 5. Configuration no longer generates or loads `api_token` or `token_storage`, and the runtime no longer accesses an OS keyring. Old OS entries are retained but inert. Only approved-device token hashes live on the companion; phones store their own tokens and pins in SecureStore.
 
-For upgrade compatibility, `allow_insecure_http` defaults to `true` and keeps the original HTTP port available to pre-Stage-2 phones. The current mobile app never sends a QR-paired token over that listener. Operators should disable it after all paired phones have upgraded and re-scanned. This transition is the remaining transport risk, not a substitute for public-Internet exposure.
+QR sessions expire after ten minutes and can enroll only once. The desktop approval deadline is two minutes. New invitations, cancellation, reset, shutdown, and invalidated sessions cannot approve stale callbacks. A device credential cannot enroll another phone. Desktop approval is reported only after the registry commit succeeds.
 
-## Current Authentication
+Every authenticated mobile request requires pinned HTTPS. Missing or corrupt pins require re-pairing; inaccessible keychain storage requires unlocking/reopening the phone app. Neither condition selects HTTP. The saved certificate identity follows an IP change, and a mismatch has no downgrade/retry path. Redirects are refused by the native pinned transport.
 
-- Pairing-session and per-device bearer tokens via `x-wakemate-token`, compared in constant time; only per-device token hashes are stored in the local registry
-- Shared pairing credential stored in the OS credential store, used to mint short-lived single-use QR sessions; rotation revokes all enrolled devices
-- Per-device revocation from the tray without disrupting other approved phones
-- Per-IP rate limiting/lockout on repeated authentication failures across all authenticated endpoints
-- Explicit desktop confirmation gate before pairing can grant input/power capabilities
-- No built-in account system
-- Built-in self-signed TLS with mobile-side leaf-certificate fingerprint pinning
+`allow_insecure_http` defaults to false, including when omitted from an older file. An explicit true enables only `GET /v1/health` without credentials; enrollment and control are absent from that listener. The current mobile app permits the same narrow public-health exception. Protocol 5 rejects legacy shared-token activation.
 
-## Operational Guidance
+Token hashes are compared in constant time. Authentication failures are rate-limited across authenticated endpoints. Responses disable caching and MIME sniffing. Request bodies, command variants, ports, addresses, wake destinations, and input ranges are validated before use.
 
-- Keep remote access disabled unless you actively need it.
-- Enable discovery only when your mobile app needs auto-discovery.
-- Upgrade and re-scan every paired phone, then set `allow_insecure_http` to `false`.
-- Rotate the pairing token after testing, screenshots, screen sharing, or suspected exposure -- this revokes every currently paired phone.
-- Use "Reset Companion..." from the tray if you want to wipe all local pairing state and start clean; it does not touch any cloud account.
-- Do not enable remote input or power actions on shared or public machines unless that risk is acceptable, and always click "Deny" on a pairing prompt you did not expect.
+## Permissions and account trust
 
-## Release Recommendation
+The least-privilege preset grants status and wake. Media, keyboard/mouse, and power are separate capability checks. The native dialog offers Status and wake only, Media remote, Desktop control, and Desktop and power presets. Existing approvals without a grant record default to status/wake; the desktop must authorize more.
 
-Before exposing WakeMATE beyond a trusted home LAN in a production release, prioritize (in order): (1) end the HTTP migration window and default `allow_insecure_http` to `false`, and (2) add an Origin/Host allowlist as defense in depth against browser-based abuse.
+A keyboard/mouse grant is broad control of the signed-in account: it can interact with applications and invoke actions beyond WakeMATE's dedicated power commands. Per-command authorization is not an account sandbox. Do not grant desktop access to a phone you would not trust to operate that account.
+
+Paired Devices supports changing grants and revoking one phone. Pause denies approved-phone operations without forgetting grants. Revoke All Phones and reset invalidate pending pairing and cancel input as well as changing durable device state. Storage errors pause authorization and are visible; unsuccessful changes must never be displayed as durable success.
+
+## Input and OS boundaries
+
+A single owned input worker receives validated commands through a queue bounded at 32. It rechecks live authorization and cancellation generations before execution and between short text chunks. Text is limited to 1024 Unicode characters; chunks contain at most 16 characters. Revoke, pause, disconnect/restart, and shutdown cancel pending work.
+
+Held mouse buttons belong to their requesting phone and expire after a two-second lease. Cancellation/watchdog cleanup releases owned synthetic state. Windows `SendInput` return counts are checked, including partial insertion. Cleanup is best effort when Windows refuses input; already emitted input cannot be rolled back. Physical modifiers and the secure desktop must remain protected.
+
+WakeMATE does not bypass UAC, OS access controls, or Secure Attention Sequence policy. Ctrl+Alt+Delete is refused as a keystroke. The structured security-screen command reports unsupported, permission-required, execution-failed, or an explicitly requested safe fallback truthfully.
+
+## Storage, recovery, and deployment limits
+
+Config migration strips retired shared-secret/global-capability fields while preserving supported preferences. `onboarding_completed` defaults false and gates LAN binds/discovery. A selected `preferred_address` must be a private IPv4 literal; invalid values fail without overwriting the file or widening the bind. A stale valid address causes a visible bind failure.
+
+Corrupt config is backed up and recovered local-only. Unreadable files fail explicitly. Corrupt device storage preserves evidence and pauses access. Persistent TLS identity corruption fails rather than silently creating a new certificate. Windows files rely on the user's app-data ACLs; a process with the same user's access can read the TLS private key or change local state.
+
+There is no automatic updater. Packaging records source/executable hashes and preserves old output separately. Current builds are unsigned unless a real signing process is configured and verified; checksums are integrity checks, not publisher authentication. macOS remains an unsigned, non-notarized headless preview without interactive approval. See the [release checklist](RELEASE_CHECKLIST.md) and [migration guide](PROTOCOL5_MIGRATION.md).

@@ -1,5 +1,5 @@
 #define MyAppName "WakeMATE Companion"
-#define MyAppVersion "0.2.4"
+#define MyAppVersion "0.3.0"
 #define MyAppPublisher "Marco Macias"
 #define MyAppURL "https://wakematemobile.com"
 #define MyAppExeName "wakemate-companion.exe"
@@ -24,7 +24,7 @@ SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
 ChangesAssociations=no
-CloseApplications=force
+CloseApplications=yes
 CloseApplicationsFilter={#MyAppExeName}
 RestartApplications=no
 UninstallDisplayIcon={app}\app-icon.ico
@@ -52,35 +52,103 @@ Source: "..\docs\THIRD_PARTY_NOTICES_TEMPLATE.md"; DestDir: "{app}"; DestName: "
 Source: "redist\{#MyVCRedistExe}"; DestDir: "{tmp}"; Flags: deleteafterinstall
 
 [Icons]
-Name: "{group}\WakeMATE Companion"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app-icon.ico"
+Name: "{group}\WakeMATE Companion"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--installed"; IconFilename: "{app}\app-icon.ico"
 Name: "{group}\Uninstall WakeMATE Companion"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\WakeMATE Companion"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app-icon.ico"; Tasks: desktopicon
+Name: "{autodesktop}\WakeMATE Companion"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--installed"; IconFilename: "{app}\app-icon.ico"; Tasks: desktopicon
 
 [Run]
 Filename: "{tmp}\{#MyVCRedistExe}"; Parameters: "/install /quiet /norestart"; StatusMsg: "Installing Microsoft Visual C++ Runtime..."; Flags: waituntilterminated runhidden skipifdoesntexist; Check: NeedsVCRedist
-; Runs on every install (not just the first) as the original interactive user
-; so config, Credential Manager, and HKCU startup state never land in an
-; over-the-shoulder administrator account.
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--prepare-install-config"; StatusMsg: "Preparing WakeMATE pairing settings..."; Flags: waituntilterminated runhidden runasoriginaluser
-; A program-scoped Private-profile rule lets trusted home LAN devices reach
-; the Companion without exposing it when Windows classifies the network as
-; Public. The rule covers both API listeners and UDP discovery for this exe.
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""WakeMATE Companion"""; StatusMsg: "Configuring Windows Firewall..."; Flags: waituntilterminated runhidden
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""WakeMATE Companion"" dir=in action=allow program=""{app}\{#MyAppExeName}"" profile=private enable=yes"; StatusMsg: "Configuring Windows Firewall..."; Flags: waituntilterminated runhidden
-Filename: "{app}\{#MyAppExeName}"; Description: "Launch WakeMATE Companion"; Flags: nowait postinstall skipifsilent runasoriginaluser
+; Per-user configuration and startup are initialized on the first normal
+; Start-menu launch. Setup never runs the tray, even when started elevated
+; under another administrator's account.
 
 [UninstallRun]
 Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""WakeMATE Companion Server"" /F"; Flags: runhidden skipifdoesntexist; RunOnceId: "RemoveBootTask"
-Filename: "{sys}\reg.exe"; Parameters: "delete ""HKCU\Software\Microsoft\Windows\CurrentVersion\Run"" /v ""WakeMATE Companion"" /f"; Flags: runhidden skipifdoesntexist; RunOnceId: "RemoveStartupRegistration"
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""WakeMATE Companion"""; Flags: runhidden; RunOnceId: "RemoveFirewallRule"
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""WakeMATE Companion HTTPS"""; Flags: runhidden; RunOnceId: "RemoveHttpsFirewallRule"
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""WakeMATE Companion Discovery"""; Flags: runhidden; RunOnceId: "RemoveDiscoveryFirewallRule"
 
 [Messages]
 WelcomeLabel1=Welcome to [name] Setup
 WelcomeLabel2=Let's get your PC ready to wake up and connect.%n%nThis will install [name/ver] on your computer, so your WakeMATE mobile app can discover it, wake it from sleep, and (once you approve pairing) control it remotely.
 FinishedHeadingLabel=WakeMATE is ready to rise and connect
-FinishedLabel=[name] is installed on your computer. No snooze button required -- open the WakeMATE app on your phone and scan the pairing QR code from the tray icon to finish connecting.
+FinishedLabel=[name] is installed. Close Setup, then open WakeMATE Companion from the Windows Start menu as your normal user. Enable private network access from the tray when you are ready, then pair your phone. Setup does not launch the companion or configure another Windows user's account.
 
 [Code]
+function OpenPathHandle(FileName: String; Access, ShareMode: Cardinal;
+  SecurityAttributes: THandle; Creation, Flags: Cardinal; Template: THandle): THandle;
+  external 'CreateFileW@kernel32.dll stdcall';
+function CanonicalPathFromHandle(Handle: THandle; Buffer: String;
+  BufferLength, Flags: Cardinal): Cardinal;
+  external 'GetFinalPathNameByHandleW@kernel32.dll stdcall';
+function OpenExitEvent(Access: Cardinal; Inherit: Integer; Name: String): THandle;
+  external 'OpenEventW@kernel32.dll stdcall';
+function SignalExitEvent(Handle: THandle): Integer;
+  external 'SetEvent@kernel32.dll stdcall';
+function CloseNativeHandle(Handle: THandle): Integer;
+  external 'CloseHandle@kernel32.dll stdcall';
+
+function RequestInstalledExit(InstalledPath: String): Boolean;
+var
+  FileHandle, EventHandle: THandle;
+  CanonicalPath, EventName: String;
+  PathLength: Cardinal;
+  Index: Integer;
+begin
+  Result := False;
+  { Resolve exactly the same physical executable path as Rust canonicalize.
+    Do not execute an installed file under Setup's administrator token. }
+  FileHandle := OpenPathHandle(InstalledPath, 0, 7, 0, 3, 0, 0);
+  if FileHandle = THandle(-1) then
+    Exit;
+  SetLength(CanonicalPath, 32768);
+  PathLength := CanonicalPathFromHandle(FileHandle, CanonicalPath, 32768, 0);
+  CloseNativeHandle(FileHandle);
+  if (PathLength = 0) or (PathLength >= 32768) then
+    Exit;
+  SetLength(CanonicalPath, PathLength);
+  for Index := 1 to Length(CanonicalPath) do
+    if (CanonicalPath[Index] >= 'A') and (CanonicalPath[Index] <= 'Z') then
+      CanonicalPath[Index] := Chr(Ord(CanonicalPath[Index]) + 32);
+  EventName := 'Global\WakeMATE-Exit-' + GetSHA256OfString(Utf8Encode(CanonicalPath));
+  EventHandle := OpenExitEvent(2, 0, EventName);
+  if EventHandle = 0 then
+    Exit;
+  Result := SignalExitEvent(EventHandle) <> 0;
+  CloseNativeHandle(EventHandle);
+end;
+
+procedure RunFirewallCommand(Command: String; Required: Boolean);
+var
+  ExitCode: Integer;
+  Started: Boolean;
+begin
+  Started := Exec(ExpandConstant('{sys}\netsh.exe'), 'advfirewall firewall ' + Command,
+    '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
+  if (not Started) or (ExitCode <> 0) then
+  begin
+    if Required then
+      RaiseException('Setup could not apply the private-LAN firewall configuration. Check Windows Firewall policy before using network access.')
+    else
+      Log('Firewall cleanup returned no matching rule or could not complete.');
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ProgramScope: String;
+begin
+  if CurStep = ssPostInstall then
+  begin
+    RunFirewallCommand('delete rule name="WakeMATE Companion"', False);
+    RunFirewallCommand('delete rule name="WakeMATE Companion HTTPS"', False);
+    RunFirewallCommand('delete rule name="WakeMATE Companion Discovery"', False);
+    ProgramScope := ' dir=in action=allow program="' + ExpandConstant('{app}\{#MyAppExeName}') + '" remoteip=LocalSubnet profile=private enable=yes';
+    RunFirewallCommand('add rule name="WakeMATE Companion HTTPS" protocol=TCP localport=7778' + ProgramScope, True);
+    RunFirewallCommand('add rule name="WakeMATE Companion Discovery" protocol=UDP localport=41234' + ProgramScope, True);
+  end;
+end;
+
 function RemoveLegacyBootTask(): String;
 var
   QueryExitCode: Integer;
@@ -131,35 +199,118 @@ begin
   end;
 end;
 
-function PrepareToInstall(var NeedsRestart: Boolean): String;
+function InstalledInstanceRunning(): Boolean;
 var
-  ExitCode: Integer;
+  Locator, Service, Processes, Process: Variant;
+  Index: Integer;
+  InstalledPath, ImagePath: String;
+begin
+  Result := False;
+  InstalledPath := ExpandConstant('{app}\{#MyAppExeName}');
+  if not FileExists(InstalledPath) then
+    Exit;
+  try
+    Locator := CreateOleObject('WbemScripting.SWbemLocator');
+    Service := Locator.ConnectServer('', 'root\CIMV2');
+    Processes := Service.ExecQuery('SELECT ProcessId, ExecutablePath FROM Win32_Process WHERE Name = ''{#MyAppExeName}''');
+    for Index := 0 to Processes.Count - 1 do
+    begin
+      Process := Processes.ItemIndex(Index);
+      if VarIsNull(Process.ExecutablePath) then
+      begin
+        { Inspection failure is never permission to terminate a process. }
+        Result := True;
+        Exit;
+      end;
+      ImagePath := Process.ExecutablePath;
+      if CompareText(ExpandFileName(ImagePath), ExpandFileName(InstalledPath)) = 0 then
+      begin
+        Result := True;
+        Exit;
+      end;
+    end;
+  except
+    Log('Could not inspect the installed WakeMATE process: ' + GetExceptionMessage);
+    Result := True;
+  end;
+end;
+
+function CloseInstalledInstance(): String;
+var
+  InstalledPath: String;
+  Attempt: Integer;
 begin
   Result := '';
+  if not InstalledInstanceRunning() then
+    Exit;
 
-  { The tray application has no ordinary window for Restart Manager to close,
-    so stop it explicitly before Setup replaces the executable. This also
-    handles a companion started by the pre-logon scheduled task. }
-  if not Exec(
-    ExpandConstant('{sys}\taskkill.exe'),
-    '/F /T /IM "{#MyAppExeName}"',
-    '',
-    SW_HIDE,
-    ewWaitUntilTerminated,
-    ExitCode
-  ) then
+  InstalledPath := ExpandConstant('{app}\{#MyAppExeName}');
+  { Only 0.3+ instances expose the path-scoped exit event. Older instances
+    must be closed from their tray; no untrusted executable runs elevated. }
+  if RequestInstalledExit(InstalledPath) then
   begin
-    Result := 'Setup could not start the Windows process closer. Close WakeMATE Companion from the system tray, then try again.';
-  end
-  else if (ExitCode <> 0) and (ExitCode <> 128) then
-  begin
-    Result := 'Setup could not close the running WakeMATE Companion. Close it from the system tray, then try again.';
-  end
-  else
-  begin
-    Sleep(500);
-    Result := RemoveLegacyBootTask();
+    for Attempt := 1 to 8 do
+    begin
+      if not InstalledInstanceRunning() then
+        Exit;
+      Sleep(1000);
+    end;
   end;
+  if InstalledInstanceRunning() then
+  begin
+    Result := 'The installed WakeMATE copy is still running. Close it from its tray icon (including another signed-in Windows session), then retry. Setup does not force-close processes or other project copies.';
+  end;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := CloseInstalledInstance();
+  if Result = '' then
+    Result := RemoveLegacyBootTask();
+end;
+
+function InitializeUninstall(): Boolean;
+var
+  CloseError: String;
+begin
+  CloseError := CloseInstalledInstance();
+  Result := CloseError = '';
+  if not Result then
+    MsgBox(CloseError, mbError, MB_OK);
+end;
+
+procedure RemoveMatchingUserStartupEntries();
+var
+  UserSids: TArrayOfString;
+  Index: Integer;
+  RunKey, Command, InstalledPath: String;
+begin
+  { HKCU under an elevated uninstaller can be a different administrator.
+    Inspect loaded user hives, and remove only a value that names this exact
+    installed executable. Never load offline hives or alter portable copies. }
+  InstalledPath := '"' + ExpandConstant('{app}\{#MyAppExeName}') + '"';
+  if RegGetSubkeyNames(HKU, '', UserSids) then
+  begin
+    for Index := 0 to GetArrayLength(UserSids) - 1 do
+    begin
+      RunKey := UserSids[Index] + '\Software\Microsoft\Windows\CurrentVersion\Run';
+      if RegQueryStringValue(HKU, RunKey, 'WakeMATE Companion', Command) then
+      begin
+        if (CompareText(Trim(Command), InstalledPath) = 0) or
+           (CompareText(Trim(Command), InstalledPath + ' --installed') = 0) then
+        begin
+          if not RegDeleteValue(HKU, RunKey, 'WakeMATE Companion') then
+            Log('Could not remove matching WakeMATE startup registration in ' + UserSids[Index]);
+        end;
+      end;
+    end;
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+    RemoveMatchingUserStartupEntries();
 end;
 
 procedure InitializeWizard;

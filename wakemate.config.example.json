@@ -1,15 +1,13 @@
 {
   "bind_address": "0.0.0.0:7777",
   "tls_port": 7778,
-  "allow_insecure_http": true,
+  "allow_insecure_http": false,
   "discovery_port": 41234,
   "discovery_message": "wakemate:discover",
-  "api_token": "replace-this-with-a-secret-token",
   "device_name": "WakeMATE Companion",
   "launch_on_startup": true,
-  "allow_input_commands": false,
-  "allow_power_commands": false,
+  "onboarding_completed": false,
+  "preferred_address": null,
   "allow_remote_connections": false,
-  "allow_discovery": false,
-  "require_auth_for_info": true
+  "allow_discovery": false
 }

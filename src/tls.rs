@@ -83,7 +83,11 @@ impl TlsIdentity {
             file.write_all(&serialized)?;
             file.sync_all()?;
             drop(file);
-            fs::rename(&temp_path, path)
+            // A hard link publishes the complete file only if the target
+            // does not exist, unlike rename which can replace a winning pin.
+            fs::hard_link(&temp_path, path)?;
+            let _ = fs::remove_file(&temp_path);
+            Ok(())
         })();
 
         match write_result {
@@ -163,6 +167,33 @@ fn fingerprint_for_certificate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_first_runs_publish_one_identity() {
+        let dir = std::env::temp_dir().join(format!("wakemate-tls-race-{}", Uuid::new_v4()));
+        let path = dir.join(TLS_IDENTITY_FILE);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    TlsIdentity::load_or_create_at(&path)
+                        .unwrap()
+                        .fingerprint()
+                        .to_string()
+                })
+            })
+            .collect();
+        let stored = threads
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(stored.iter().all(|fp| fp == &stored[0]));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn generated_identity_is_reused_with_a_stable_sha256_fingerprint() {

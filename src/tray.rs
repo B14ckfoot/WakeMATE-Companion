@@ -12,7 +12,6 @@ use font8x8::{UnicodeFonts, BASIC_FONTS};
 use image::ImageReader;
 use qrcodegen::{QrCode, QrCodeEcc};
 use softbuffer::{Context as SoftbufferContext, Surface as SoftbufferSurface};
-use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu},
@@ -31,9 +30,12 @@ use winit::{
 
 use crate::{
     config::{AppConfig, SharedConfig},
-    devices::{DeviceRegistry, PairedDevice, SharedDeviceRegistry},
+    desktop::{self, SettingsAction},
+    devices::{DeviceRegistry, PairedDevice, Permissions, SharedDeviceRegistry},
     pairing::{NotifierContext, PairingCoordinator},
-    pairing_qr, run_server, system, theme,
+    pairing_qr,
+    server_thread::ServerThread,
+    system, theme,
     tls::TlsIdentity,
 };
 
@@ -79,9 +81,12 @@ struct TrayApp {
     server: ServerThread,
     tray_icon: Option<TrayIcon>,
     pairing_popup: Option<PairingPopup>,
+    pairing_popup_requested: bool,
     tray_menu: Option<TrayMenu>,
     /// Menu id -> paired device id, rebuilt with the submenu.
     device_menu_ids: Vec<(MenuId, String)>,
+    permission_menu_ids: Vec<(MenuId, String)>,
+    exit_signal: system::ExitSignal,
     /// Snapshot backing change detection for the submenu rebuild; `None`
     /// until the submenu has been populated once.
     last_device_list: Option<Vec<PairedDevice>>,
@@ -96,7 +101,8 @@ impl TrayApp {
         registry: SharedDeviceRegistry,
         assets_dir: PathBuf,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let server = ServerThread::spawn(config.clone(), registry.clone())?;
+        let server =
+            ServerThread::spawn(config.clone(), registry.clone(), windows_pairing_notifier)?;
 
         Ok(Self {
             config: config.clone(),
@@ -105,8 +111,11 @@ impl TrayApp {
             server,
             tray_icon: None,
             pairing_popup: None,
+            pairing_popup_requested: false,
             tray_menu: None,
             device_menu_ids: Vec::new(),
+            permission_menu_ids: Vec::new(),
+            exit_signal: system::ExitSignal::create().map_err(io::Error::other)?,
             last_device_list: None,
             startup_error: None,
             next_config_poll: Instant::now() + CONFIG_POLL_INTERVAL,
@@ -128,8 +137,8 @@ impl TrayApp {
         let snapshot = config_snapshot(&self.config)?;
         let menu = Menu::new();
         let status = MenuItem::new(self.status_label(), false, None);
-        let paired_devices = Submenu::new("Connected Devices", true);
-        let show_pairing_qr = MenuItem::new("QR Code", true, None);
+        let paired_devices = Submenu::new("Paired Devices", true);
+        let show_pairing_qr = MenuItem::new("View Pairing QR Code", true, None);
         let restart_connection = MenuItem::new("Restart Connection", true, None);
         let quit = MenuItem::new("Quit WakeMATE", true, None);
 
@@ -141,11 +150,29 @@ impl TrayApp {
             snapshot.launch_on_startup,
             None,
         );
-        let rotate_pairing_token = MenuItem::new("Rotate Pairing Token", true, None);
+        let rotate_pairing_token = MenuItem::new("Revoke All Phones...", true, None);
+        let settings_window = MenuItem::new("Open Settings...", true, None);
+        let pause_access = CheckMenuItem::new(
+            "Pause Remote Access",
+            true,
+            self.registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .paused(),
+            None,
+        );
+        let network_access = CheckMenuItem::new(
+            "Enable Private LAN Access",
+            true,
+            snapshot.allow_remote_connections && snapshot.onboarding_completed,
+            None,
+        );
         let open_data_folder = MenuItem::new("Open Data Folder", true, None);
         let reset_companion = MenuItem::new("Reset Companion...", true, None);
         let settings_separator = PredefinedMenuItem::separator();
 
+        settings.append(&settings_window)?;
+        settings.append(&network_access)?;
         settings.append(&launch_on_startup)?;
         settings.append(&rotate_pairing_token)?;
         settings.append(&settings_separator)?;
@@ -159,6 +186,8 @@ impl TrayApp {
             status: status.clone(),
             launch_on_startup: launch_on_startup.clone(),
             paired_devices: paired_devices.clone(),
+            pause_access: pause_access.clone(),
+            network_access: network_access.clone(),
             ids: MenuIds {
                 show_pairing_qr: show_pairing_qr.id().clone(),
                 restart_connection: restart_connection.id().clone(),
@@ -167,11 +196,15 @@ impl TrayApp {
                 open_data_folder: open_data_folder.id().clone(),
                 reset_companion: reset_companion.id().clone(),
                 quit: quit.id().clone(),
+                settings_window: settings_window.id().clone(),
+                pause_access: pause_access.id().clone(),
+                network_access: network_access.id().clone(),
             },
         };
 
         menu.append(&status)?;
         menu.append(&separator_top)?;
+        menu.append(&pause_access)?;
         menu.append(&paired_devices)?;
         menu.append(&show_pairing_qr)?;
         menu.append(&settings)?;
@@ -195,7 +228,7 @@ impl TrayApp {
         Ok(())
     }
 
-    /// Rebuilds the "Connected Devices" submenu when the registry changed
+    /// Rebuilds the "Paired Devices" submenu when the registry changed
     /// (a new approval from the notifier thread, or a revocation here).
     fn refresh_paired_devices_menu(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let devices = self
@@ -214,17 +247,27 @@ impl TrayApp {
 
         while tray_menu.paired_devices.remove_at(0).is_some() {}
         self.device_menu_ids.clear();
+        self.permission_menu_ids.clear();
 
         if devices.is_empty() {
             let placeholder = MenuItem::new("No phones paired yet", false, None);
             tray_menu.paired_devices.append(&placeholder)?;
         } else {
             for device in &devices {
-                let label = format!("Revoke \"{}\"", popup_device_label(&device.name, 32));
-                let item = MenuItem::new(label, true, None);
-                tray_menu.paired_devices.append(&item)?;
+                let entry = Submenu::new(popup_device_label(&device.name, 32), true);
+                let permission = MenuItem::new(
+                    format!("Permissions: {}...", device.permissions.label()),
+                    true,
+                    None,
+                );
+                let revoke = MenuItem::new("Revoke this phone...", true, None);
+                entry.append(&permission)?;
+                entry.append(&revoke)?;
+                tray_menu.paired_devices.append(&entry)?;
+                self.permission_menu_ids
+                    .push((permission.id().clone(), device.id.clone()));
                 self.device_menu_ids
-                    .push((item.id().clone(), device.id.clone()));
+                    .push((revoke.id().clone(), device.id.clone()));
             }
         }
 
@@ -237,6 +280,15 @@ impl TrayApp {
 
         if let Some(tray_menu) = &self.tray_menu {
             tray_menu.status.set_text(self.status_label());
+            tray_menu.pause_access.set_checked(
+                self.registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .paused(),
+            );
+            tray_menu
+                .network_access
+                .set_checked(snapshot.allow_remote_connections && snapshot.onboarding_completed);
             tray_menu
                 .launch_on_startup
                 .set_checked(snapshot.launch_on_startup);
@@ -267,28 +319,42 @@ impl TrayApp {
             return format!("{} — Error: {error}", config.device_name);
         }
 
-        let state = if !self.server.active {
+        let status = self.server.status.lock().unwrap_or_else(|p| p.into_inner());
+        let registry = self.registry.lock().unwrap_or_else(|p| p.into_inner());
+        let state = if registry.storage_error().is_some() {
+            "Storage error - remote access paused"
+        } else if !self.server.active {
             "Server not running"
-        } else if !config.allow_remote_connections {
-            "Local only — not discoverable"
-        } else if config.allow_input_commands || config.allow_power_commands {
-            "Paired — remote control enabled"
-        } else {
+        } else if !status.https_ready {
+            "Starting HTTPS..."
+        } else if registry.paused() {
+            "Remote access paused"
+        } else if status.error.is_some() {
+            "HTTPS ready - discovery unavailable"
+        } else if !config.allow_remote_connections || !config.onboarding_completed {
+            "Local only - open Settings to connect"
+        } else if registry.list().is_empty() {
             "Ready to pair"
+        } else {
+            "Ready - device permissions active"
         };
 
         format!("{} — {state}", config.device_name)
     }
 
     fn address_label(&self, config: &AppConfig) -> String {
-        let port = config.bind_port();
+        let port = config.tls_port;
         if config.allow_remote_connections {
-            match system::local_ipv4() {
-                Some(ip) => format!("{ip}:{port}"),
+            match config
+                .preferred_address
+                .clone()
+                .or_else(|| crate::network::primary().map(|n| n.local_ip))
+            {
+                Some(ip) => format!("https://{ip}:{port}"),
                 None => format!("port {port}"),
             }
         } else {
-            format!("localhost:{port}")
+            format!("https://localhost:{port}")
         }
     }
 
@@ -297,6 +363,25 @@ impl TrayApp {
         event_loop: &ActiveEventLoop,
         event: MenuEvent,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(menu) = &self.tray_menu {
+            if event.id == menu.ids.settings_window {
+                return self.open_settings(event_loop);
+            }
+            if event.id == menu.ids.pause_access {
+                return self.toggle_pause();
+            }
+            if event.id == menu.ids.network_access {
+                return self.toggle_network();
+            }
+        }
+        if let Some(id) = self
+            .permission_menu_ids
+            .iter()
+            .find(|(menu, _)| *menu == event.id)
+            .map(|(_, id)| id.clone())
+        {
+            return self.edit_permissions(&id);
+        }
         let Some((
             show_pairing_qr,
             restart_connection,
@@ -332,6 +417,7 @@ impl TrayApp {
             system::open_path(&AppConfig::data_dir()?)?;
         } else if event.id == reset_companion {
             self.reset_companion()?;
+            self.open_settings(event_loop)?;
         } else if event.id == quit {
             info!("WakeMATE quit requested from tray");
             event_loop.exit();
@@ -374,11 +460,13 @@ impl TrayApp {
             return Ok(());
         }
 
+        self.cancel_pending_pairing();
+        self.server.input.cancel_device(device_id);
         let removed = self
             .registry
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .revoke(device_id);
+            .revoke(device_id)?;
 
         if let Some(removed) = removed {
             info!(device = %removed.name, "WakeMATE paired phone revoked from the tray");
@@ -402,21 +490,28 @@ impl TrayApp {
             return Ok(());
         }
 
-        self.pairing_popup = None;
+        self.invalidate_pairing();
+        self.server.input.cancel_all();
         self.registry
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .revoke_all();
-        let restart_needed = {
+            .unwrap_or_else(|p| p.into_inner())
+            .set_paused(true)?;
+        self.registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .revoke_all()?;
+        {
             let mut config = self
                 .config
                 .lock()
-                .map_err(|_| io::Error::other("failed to access config"))?;
-            let previous = ServerRuntimeConfig::from(&*config);
+                .map_err(|_| io::Error::other("Configuration unavailable"))?;
             config.reset_to_defaults();
             config.save()?;
-            previous != ServerRuntimeConfig::from(&*config)
-        };
+        }
+        self.registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .reset()?;
 
         if let Err(error) =
             system::sync_launch_on_startup(config_snapshot(&self.config)?.launch_on_startup)
@@ -426,10 +521,8 @@ impl TrayApp {
 
         self.refresh_tray_state()?;
         self.refresh_paired_devices_menu()?;
-        if restart_needed {
-            self.server
-                .restart(self.config.clone(), self.registry.clone())?;
-        }
+        self.server
+            .restart(self.config.clone(), self.registry.clone())?;
         info!("WakeMATE Companion was reset to defaults from the tray");
         Ok(())
     }
@@ -468,6 +561,35 @@ impl TrayApp {
             return Ok(());
         }
 
+        let config = config_snapshot(&self.config)?;
+        if self
+            .registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .paused()
+        {
+            return Err(io::Error::other(
+                "Remote access is paused. Resume it in WakeMATE settings before pairing.",
+            )
+            .into());
+        }
+        if !config.allow_remote_connections || !config.onboarding_completed {
+            self.toggle_network()?;
+            if !config_snapshot(&self.config)?.allow_remote_connections {
+                return Ok(());
+            }
+        }
+        if !self
+            .server
+            .status
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .https_ready
+        {
+            self.pairing_popup_requested = true;
+            return Ok(());
+        }
+        self.pairing_popup_requested = false;
         let tray_rect = self.tray_icon.as_ref().and_then(|icon| icon.rect());
         let owner_window = self
             .tray_icon
@@ -517,30 +639,179 @@ impl TrayApp {
         Ok(())
     }
 
+    fn cancel_pending_pairing(&mut self) {
+        self.pairing_popup_requested = false;
+        if let Some(pairing) = &self.server.pairing {
+            pairing.cancel_pending();
+        }
+        self.pairing_popup = None;
+    }
+
+    fn invalidate_pairing(&mut self) {
+        self.pairing_popup_requested = false;
+        if let Some(pairing) = &self.server.pairing {
+            pairing.invalidate();
+        }
+        self.pairing_popup = None;
+    }
+
     fn rotate_pairing_token(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let new_token = {
+        if !system::confirm_dialog(
+            "Revoke all phones?",
+            "Every phone will lose access immediately and need to scan a fresh QR code. Continue?",
+        ) {
+            return Ok(());
+        }
+        self.invalidate_pairing();
+        self.server.input.cancel_all();
+        {
+            let mut registry = self.registry.lock().unwrap_or_else(|p| p.into_inner());
+            let was_paused = registry.paused();
+            registry.set_paused(true)?;
+            registry.revoke_all()?;
+            if !was_paused {
+                registry.set_paused(false)?;
+            }
+        }
+        self.refresh_paired_devices_menu()?;
+        self.server
+            .restart(self.config.clone(), self.registry.clone())?;
+        self.refresh_tray_state()?;
+        Ok(())
+    }
+
+    fn toggle_pause(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.server.input.cancel_all();
+        let result = {
+            let mut registry = self.registry.lock().unwrap_or_else(|p| p.into_inner());
+            let next = !registry.paused();
+            registry.set_paused(next)
+        };
+        // Never hold registry while taking the coordinator lifecycle gate.
+        self.cancel_pending_pairing();
+        result?;
+        self.refresh_tray_state()
+    }
+
+    fn toggle_network(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let current = config_snapshot(&self.config)?;
+        let enable = !current.allow_remote_connections || !current.onboarding_completed;
+        if enable && !system::confirm_dialog("Enable WakeMATE on your private LAN?", "Your phone can discover this computer's name and request pairing on the same private network. Remote commands still require your desktop approval and selected device permissions. Enable LAN access?") {
+            self.refresh_tray_state()?;
+            return Ok(());
+        }
+        let preferred = if enable {
+            let Some(selected) = desktop::network_address(current.preferred_address.as_deref())?
+            else {
+                self.refresh_tray_state()?;
+                return Ok(());
+            };
+            selected
+        } else {
+            current.preferred_address.clone()
+        };
+        self.server.input.cancel_all();
+        {
             let mut config = self
                 .config
                 .lock()
-                .map_err(|_| std::io::Error::other("failed to access config"))?;
-            let new_token = config.rotate_api_token();
-            config.save()?;
-            new_token
+                .map_err(|_| io::Error::other("Configuration unavailable"))?;
+            let mut proposed = config.clone();
+            proposed.onboarding_completed = true;
+            proposed.allow_remote_connections = enable;
+            proposed.allow_discovery = enable;
+            proposed.preferred_address = preferred;
+            proposed.save()?;
+            *config = proposed;
+        }
+        self.restart_connection()
+    }
+
+    fn open_settings(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let config = config_snapshot(&self.config)?;
+        let (paused, error, count) = {
+            let registry = self.registry.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                registry.paused(),
+                registry.storage_error().map(str::to_owned),
+                registry.list().len(),
+            )
         };
-
-        // Rotation keeps its documented "revokes every phone at once"
-        // semantics: per-device tokens die together with the QR token.
-        self.registry
+        let status = self
+            .server
+            .status
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .revoke_all();
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let details = format!("{}\n{}\n\nPaired phones: {}\nHTTPS: {}\nDiscovery: {}\nNetwork adapter: {}\n\n{}\n\nChange each phone's permissions under Paired Devices in the tray. Offline Wake-on-LAN works directly from the phone; online control starts after Windows sign-in.",
+            config.device_name, self.status_label(), count, if status.https_ready { "Listening" } else { "Starting / unavailable" },
+            if status.discovery_ready { "Listening" } else { "Disabled / unavailable" },
+            config.preferred_address.as_deref().unwrap_or("Automatic (private adapters)"),
+            error.or(status.error).unwrap_or_else(|| "Local operation. No cloud accounts or telemetry.".into()));
+        match desktop::settings(
+            &details,
+            config.allow_remote_connections && config.onboarding_completed,
+            paused,
+        )? {
+            SettingsAction::Network => self.toggle_network()?,
+            SettingsAction::Pause => self.toggle_pause()?,
+            SettingsAction::Pair => self.toggle_pairing_qr_popup(event_loop)?,
+            SettingsAction::Adapter => {
+                if let Some(preferred) =
+                    desktop::network_address(config.preferred_address.as_deref())?
+                {
+                    let mut current = self
+                        .config
+                        .lock()
+                        .map_err(|_| io::Error::other("Configuration unavailable"))?;
+                    let mut proposed = current.clone();
+                    proposed.preferred_address = preferred;
+                    proposed.save()?;
+                    *current = proposed;
+                    drop(current);
+                    self.restart_connection()?;
+                }
+            }
+            SettingsAction::None => {
+                if !config.onboarding_completed {
+                    let mut current = self
+                        .config
+                        .lock()
+                        .map_err(|_| io::Error::other("Configuration unavailable"))?;
+                    current.allow_remote_connections = false;
+                    current.allow_discovery = false;
+                    current.onboarding_completed = true;
+                    current.save()?;
+                }
+            }
+        }
+        self.refresh_tray_state()
+    }
 
-        self.pairing_popup = None;
-        self.refresh_tray_state()?;
-        self.refresh_paired_devices_menu()?;
-        info!("WakeMATE pairing token rotated; all paired phones revoked");
-        info!(token_length = new_token.len(), "new pairing token saved");
-        Ok(())
+    fn edit_permissions(&mut self, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let device = self
+            .registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .list()
+            .into_iter()
+            .find(|d| d.id == id);
+        let Some(device) = device else {
+            return Ok(());
+        };
+        if let Some(permissions) = desktop::permissions(&device.name, device.permissions, None)? {
+            self.cancel_pending_pairing();
+            self.server.input.cancel_device(id);
+            self.registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .set_permissions(id, permissions)?;
+            self.refresh_paired_devices_menu()?;
+        }
+        self.refresh_tray_state()
     }
 
     fn reload_config_if_changed(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -620,6 +891,15 @@ impl ApplicationHandler<UserEvent> for TrayApp {
             self.startup_error = Some(error.to_string());
             error!(error = %error, "failed to initialize tray icon");
             event_loop.exit();
+            return;
+        }
+        if config_snapshot(&self.config)
+            .map(|c| !c.onboarding_completed)
+            .unwrap_or(false)
+        {
+            if let Err(error) = self.open_settings(event_loop) {
+                system::show_error_dialog("WakeMATE setup", &error.to_string());
+            }
         }
     }
 
@@ -628,6 +908,7 @@ impl ApplicationHandler<UserEvent> for TrayApp {
             UserEvent::Menu(menu_event) => {
                 if let Err(error) = self.handle_menu_event(event_loop, menu_event) {
                     error!(error = %error, "failed to handle tray menu event");
+                    system::show_error_dialog("WakeMATE could not complete this change", &format!("{error}\n\nIf you were revoking a phone or resetting pairing, quit WakeMATE until the data folder is writable and the disk has space. Retry the change before resuming normal use."));
                 }
             }
         }
@@ -671,7 +952,22 @@ impl ApplicationHandler<UserEvent> for TrayApp {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
+        if self.exit_signal.requested() {
+            event_loop.exit();
+            return;
+        }
+        if self
+            .pairing_popup
+            .as_ref()
+            .is_some_and(|popup| popup.created_at.elapsed() >= Duration::from_secs(600))
+        {
+            self.pairing_popup = None;
+        }
         if now >= self.next_config_poll {
+            if let Some(pairing) = &self.server.pairing {
+                pairing.approval_state();
+            }
+            let _ = self.refresh_tray_state();
             if let Err(error) = self.refresh_server_health() {
                 error!(error = %error, "failed to refresh WakeMATE server health");
             }
@@ -679,13 +975,29 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                 error!(error = %error, "failed to reload config changes from disk");
             }
             // Approvals land on the notifier thread; pick them up here so
-            // the "Connected Devices" submenu stays current.
+            // the "Paired Devices" submenu stays current.
             if let Err(error) = self.refresh_paired_devices_menu() {
                 error!(error = %error, "failed to refresh the paired-devices menu");
             }
             self.next_config_poll = Instant::now() + CONFIG_POLL_INTERVAL;
         }
 
+        if self.pairing_popup_requested {
+            let ready = self
+                .server
+                .status
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .https_ready;
+            if !self.server.active {
+                self.pairing_popup_requested = false;
+            } else if ready {
+                if let Err(error) = self.toggle_pairing_qr_popup(event_loop) {
+                    self.pairing_popup_requested = false;
+                    system::show_error_dialog("Pairing code unavailable", &error.to_string());
+                }
+            }
+        }
         let mut close_popup = false;
         let popup_deadline = Instant::now() + Duration::from_millis(16);
 
@@ -724,12 +1036,17 @@ struct MenuIds {
     open_data_folder: MenuId,
     reset_companion: MenuId,
     quit: MenuId,
+    settings_window: MenuId,
+    pause_access: MenuId,
+    network_access: MenuId,
 }
 
 struct TrayMenu {
     status: MenuItem,
     launch_on_startup: CheckMenuItem,
     paired_devices: Submenu,
+    pause_access: CheckMenuItem,
+    network_access: CheckMenuItem,
     ids: MenuIds,
 }
 
@@ -738,6 +1055,7 @@ struct PairingPopup {
     _context: PopupContext,
     surface: PopupSurface,
     qr_payload: String,
+    created_at: Instant,
     device_name: String,
     last_mouse_buttons: MouseButtons,
 }
@@ -800,6 +1118,7 @@ impl PairingPopup {
             snapshot.bind_port(),
             snapshot.tls_port,
             tls_identity.fingerprint(),
+            snapshot.preferred_address.as_deref(),
         );
 
         Ok(Self {
@@ -807,6 +1126,7 @@ impl PairingPopup {
             _context: context,
             surface,
             qr_payload,
+            created_at: Instant::now(),
             device_name: snapshot.device_name,
             last_mouse_buttons: current_mouse_buttons(),
         })
@@ -1459,122 +1779,6 @@ fn lerp_channel(start: u8, end: u8, mix: f32) -> u8 {
     (start + (end - start) * mix).round().clamp(0.0, 255.0) as u8
 }
 
-struct ServerThread {
-    active: bool,
-    shutdown_tx: Option<oneshot::Sender<()>>,
-    join_handle: Option<thread::JoinHandle<Result<(), String>>>,
-    /// The pairing coordinator this thread's server was constructed with, so
-    /// the tray can mint pairing-session tokens that the *same* running
-    /// server instance will actually recognize. Set to `None` after that
-    /// server stops so the tray refuses to display an unusable pairing QR.
-    pairing: Option<Arc<PairingCoordinator>>,
-}
-
-impl ServerThread {
-    fn spawn(
-        config: SharedConfig,
-        registry: SharedDeviceRegistry,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        let pairing = Arc::new(PairingCoordinator::new(Some(Arc::new(
-            windows_pairing_notifier,
-        ))));
-        let pairing_for_server = pairing.clone();
-
-        let join_handle = thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())?;
-
-            runtime
-                .block_on(async move {
-                    run_server(config, pairing_for_server, registry, false, async move {
-                        let _ = shutdown_rx.await;
-                    })
-                    .await
-                })
-                .map_err(|error| error.to_string())
-        });
-
-        Ok(Self {
-            active: true,
-            shutdown_tx: Some(shutdown_tx),
-            join_handle: Some(join_handle),
-            pairing: Some(pairing),
-        })
-    }
-
-    fn shutdown(&mut self) {
-        if !self.active {
-            return;
-        }
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
-        }
-    }
-
-    fn restart(
-        &mut self,
-        config: SharedConfig,
-        registry: SharedDeviceRegistry,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        if self.active {
-            if let Err(error) = self.finish() {
-                warn!(%error, "previous WakeMATE server stopped with an error before restart");
-            }
-        }
-        *self = Self::spawn(config, registry)?;
-        Ok(())
-    }
-
-    /// Collects a server thread that ended without a tray shutdown request.
-    /// This turns bind failures and other listener exits into an explicit tray
-    /// error instead of silently treating an arbitrary TCP service as the
-    /// WakeMATE server.
-    fn take_unexpected_failure(&mut self) -> Option<String> {
-        let finished = self
-            .join_handle
-            .as_ref()
-            .is_some_and(|handle| handle.is_finished());
-        if !self.active || !finished {
-            return None;
-        }
-
-        self.active = false;
-        self.shutdown_tx.take();
-        self.pairing = None;
-
-        let result = match self.join_handle.take()?.join() {
-            Ok(Ok(())) => "WakeMATE server stopped unexpectedly".to_string(),
-            Ok(Err(error)) => error,
-            Err(_) => "WakeMATE server thread panicked".to_string(),
-        };
-        Some(result)
-    }
-
-    fn finish(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if !self.active {
-            return Ok(());
-        }
-        self.shutdown();
-
-        let result = if let Some(join_handle) = self.join_handle.take() {
-            match join_handle.join() {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(std::io::Error::other(error).into()),
-                Err(_) => Err(std::io::Error::other("WakeMATE server thread panicked").into()),
-            }
-        } else {
-            Ok(())
-        };
-
-        self.active = false;
-        self.pairing = None;
-        result
-    }
-}
-
 fn config_snapshot(config: &SharedConfig) -> Result<AppConfig, Box<dyn std::error::Error>> {
     config
         .lock()
@@ -1597,12 +1801,12 @@ fn pairing_qr_payload(
     api_port: u16,
     tls_port: u16,
     tls_fingerprint: &str,
+    preferred_address: Option<&str>,
 ) -> String {
-    let network = system::primary_network_info();
-    let ip = network
-        .as_ref()
-        .map(|info| info.local_ip.clone())
-        .or_else(system::local_ipv4);
+    let network = crate::network::candidates()
+        .into_iter()
+        .find(|n| preferred_address.is_none_or(|ip| ip == n.local_ip));
+    let ip = network.as_ref().map(|info| info.local_ip.clone());
     let mac = network.as_ref().and_then(|info| info.mac_address.clone());
 
     pairing_qr::payload_from_parts(
@@ -1618,57 +1822,22 @@ fn pairing_qr_payload(
 
 fn windows_pairing_notifier(context: NotifierContext) {
     thread::spawn(move || {
-        let NotifierContext {
-            info,
-            config,
-            status,
-            enrollment,
-            registry,
-        } = context;
-
-        let device_hint = enrollment
+        let device_hint = context
+            .enrollment
             .pending_device_name()
-            .map(|name| format!("\"{name}\" (at {})", info.peer))
-            .unwrap_or_else(|| info.peer.to_string());
-
-        let approved = system::confirm_pairing_dialog(&device_hint);
-
-        if !approved {
-            enrollment.clear();
-            status.record_outcome(false);
-            info!(peer = %info.peer, "WakeMATE pairing request denied on the desktop");
-            return;
-        }
-
-        // Commit the enrollment (if this prompt was for one) so the phone's
-        // per-device token starts authenticating. `commit_valid` leaves it
-        // visibly pending until the registry contains it, so status polling
-        // can never observe a false denial during this transition.
-        if let Some(pending) = enrollment.commit_valid(&registry) {
-            info!(
-                device = %pending.device_name,
-                peer = %info.peer,
-                "WakeMATE registered a paired phone with its own token"
-            );
-        }
-        status.record_outcome(true);
-
-        let outcome = (|| -> Result<(), Box<dyn std::error::Error>> {
-            let mut guard = config
-                .lock()
-                .map_err(|_| std::io::Error::other("failed to access config"))?;
-            guard.allow_input_commands = true;
-            guard.allow_power_commands = true;
-            guard.save()?;
-            Ok(())
-        })();
-
-        match outcome {
-            Ok(()) => info!(
-                peer = %info.peer,
-                "WakeMATE pairing approved on the desktop; input and power control enabled"
-            ),
-            Err(error) => error!(%error, "failed to persist approved pairing settings"),
+            .map(|name| format!("\"{name}\" (at {})", context.info.peer))
+            .unwrap_or_else(|| context.info.peer.to_string());
+        let choice = desktop::permissions(&device_hint, Permissions::default(), Some(&context));
+        let result = choice.and_then(|permissions| context.complete_permissions(permissions));
+        match result {
+            Ok(true) => info!(peer = %context.info.peer, "WakeMATE pairing saved and approved"),
+            Ok(false) => {
+                info!(peer = %context.info.peer, "WakeMATE pairing denied, expired, or cancelled")
+            }
+            Err(error) => {
+                error!(%error, "failed to save pairing approval");
+                system::show_error_dialog("Pairing could not be saved", "WakeMATE could not save this pairing. Check that the data folder is writable and the disk has space, then scan a new QR code.");
+            }
         }
     });
 }

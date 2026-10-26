@@ -6,7 +6,10 @@ use std::{
 
 use tracing::info;
 
-use crate::{config::SharedConfig, devices::SharedDeviceRegistry};
+use crate::{
+    config::SharedConfig,
+    devices::{Permissions, SharedDeviceRegistry},
+};
 
 /// Minimum time between desktop confirmation prompts. A device that already
 /// holds a valid token can still hammer `/v1/pairing/activate`; this keeps
@@ -57,7 +60,7 @@ pub struct PendingEnrollment {
     pub device_id: String,
     pub device_name: String,
     pub token: String,
-    pub requested_at: Instant,
+    pub expires_at: Instant,
 }
 
 impl PendingEnrollment {
@@ -66,12 +69,12 @@ impl PendingEnrollment {
             device_id: uuid::Uuid::new_v4().to_string(),
             device_name,
             token: uuid::Uuid::new_v4().to_string(),
-            requested_at: Instant::now(),
+            expires_at: Instant::now() + ENROLLMENT_TTL,
         }
     }
 
     fn expired(&self) -> bool {
-        self.requested_at.elapsed() > ENROLLMENT_TTL
+        Instant::now() >= self.expires_at
     }
 }
 
@@ -116,18 +119,33 @@ impl EnrollmentSlot {
     /// hold the registry lock through their enrollment check, so they see
     /// either pending (before registration) or approved (after it), never a
     /// false denial between.
-    pub fn commit_valid(&self, registry: &SharedDeviceRegistry) -> Option<PendingEnrollment> {
-        let pending = {
-            let guard = self.lock();
-            guard.as_ref().filter(|pending| !pending.expired()).cloned()
-        }?;
+    #[cfg(test)]
+    pub fn commit_valid(
+        &self,
+        registry: &SharedDeviceRegistry,
+    ) -> std::io::Result<Option<PendingEnrollment>> {
+        self.commit_with_permissions(registry, Permissions::default())
+    }
 
-        registry
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .register_with_id(&pending.device_id, &pending.device_name, &pending.token);
-        self.clear();
-        Some(pending)
+    pub fn commit_with_permissions(
+        &self,
+        registry: &SharedDeviceRegistry,
+        permissions: Permissions,
+    ) -> std::io::Result<Option<PendingEnrollment>> {
+        let mut registry = registry.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut slot = self.lock();
+        let Some(pending) = slot.as_ref().filter(|pending| !pending.expired()).cloned() else {
+            *slot = None;
+            return Ok(None);
+        };
+        registry.register_with_permissions(
+            &pending.device_id,
+            &pending.device_name,
+            &pending.token,
+            permissions,
+        )?;
+        *slot = None;
+        Ok(Some(pending))
     }
 
     /// Device name for the desktop prompt, if an enrollment is waiting.
@@ -159,13 +177,14 @@ impl EnrollmentSlot {
 /// after the token that started the enrollment has already been consumed.
 struct PairingSession {
     token: String,
-    minted_at: Instant,
+    expires_at: Instant,
     consumed: bool,
+    device_id: Option<String>,
 }
 
 impl PairingSession {
     fn expired(&self) -> bool {
-        self.minted_at.elapsed() > PAIRING_SESSION_TTL
+        Instant::now() >= self.expires_at
     }
 }
 
@@ -189,8 +208,9 @@ impl PairingSessionSlot {
         let token = uuid::Uuid::new_v4().to_string();
         *self.lock() = Some(PairingSession {
             token: token.clone(),
-            minted_at: Instant::now(),
+            expires_at: Instant::now() + PAIRING_SESSION_TTL,
             consumed: false,
+            device_id: None,
         });
         token
     }
@@ -223,7 +243,12 @@ impl PairingSessionSlot {
     /// Consumes the token for a state-changing pairing action. Returns
     /// `true` at most once per minted token, so a leaked QR code or link
     /// cannot be replayed to enroll unlimited devices after the first use.
+    #[cfg(test)]
     pub fn try_consume(&self, candidate: &str) -> bool {
+        self.try_consume_for(candidate, None)
+    }
+
+    fn try_consume_for(&self, candidate: &str, device_id: Option<&str>) -> bool {
         let mut guard = self.lock();
         let Some(session) = guard.as_mut() else {
             return false;
@@ -235,7 +260,15 @@ impl PairingSessionSlot {
             return false;
         }
         session.consumed = true;
+        session.device_id = device_id.map(str::to_owned);
         true
+    }
+
+    fn enrolled_device(&self, candidate: &str) -> Option<String> {
+        self.lock()
+            .as_ref()
+            .filter(|s| !s.expired() && crate::security::tokens_match(candidate, &s.token))
+            .and_then(|s| s.device_id.clone())
     }
 }
 
@@ -301,10 +334,65 @@ impl PairingStatusHandle {
 /// pending device), and the registry (where a committed device lands).
 pub struct NotifierContext {
     pub info: PairingRequestInfo,
-    pub config: SharedConfig,
     pub status: Arc<PairingStatusHandle>,
     pub enrollment: Arc<EnrollmentSlot>,
     pub registry: SharedDeviceRegistry,
+    lifecycle: Arc<Mutex<bool>>,
+    active_prompt: Arc<Mutex<Option<(uuid::Uuid, Instant)>>>,
+    prompt_id: uuid::Uuid,
+    expires_at: Instant,
+    is_enrollment: bool,
+}
+
+impl NotifierContext {
+    /// Resolve a desktop prompt under the same gate used by reset/restart.
+    /// A stale window can still be dismissed, but can no longer grant access.
+    pub fn is_active(&self) -> bool {
+        let cancelled = self.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+        !*cancelled
+            && Instant::now() < self.expires_at
+            && self
+                .active_prompt
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+                .is_some_and(|(id, _)| *id == self.prompt_id)
+    }
+
+    pub fn complete_permissions(&self, permissions: Option<Permissions>) -> Result<bool, String> {
+        let cancelled = self.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+        let mut active = self.active_prompt.lock().unwrap_or_else(|p| p.into_inner());
+        if *cancelled || active.as_ref().is_none_or(|(id, _)| *id != self.prompt_id) {
+            return Ok(false);
+        }
+        if permissions.is_none()
+            || Instant::now() >= self.expires_at
+            || (self.is_enrollment && self.enrollment.pending_device_name().is_none())
+        {
+            self.enrollment.clear();
+            self.status.record_outcome(false);
+            *active = None;
+            return Ok(false);
+        }
+        // Grant and token hash share a single atomic registry write. Approval
+        // never edits global config and cannot elevate other phones.
+        let result = if self.is_enrollment {
+            self.enrollment
+                .commit_with_permissions(&self.registry, permissions.unwrap_or_default())
+                .map_err(|e| e.to_string())
+                .and_then(|pending| {
+                    pending
+                        .map(|_| ())
+                        .ok_or_else(|| "Pairing request expired".into())
+                })
+        } else {
+            Err("Legacy activation is retired; scan a new pairing QR code".into())
+        };
+        self.enrollment.clear();
+        self.status.record_outcome(result.is_ok());
+        *active = None;
+        result.map(|()| true)
+    }
 }
 
 type Notifier = dyn Fn(NotifierContext) + Send + Sync;
@@ -320,6 +408,8 @@ pub struct PairingCoordinator {
     enrollment: Arc<EnrollmentSlot>,
     session: Arc<PairingSessionSlot>,
     last_prompt_at: Mutex<Option<Instant>>,
+    lifecycle: Arc<Mutex<bool>>,
+    active_prompt: Arc<Mutex<Option<(uuid::Uuid, Instant)>>>,
 }
 
 impl PairingCoordinator {
@@ -330,6 +420,8 @@ impl PairingCoordinator {
             enrollment: Arc::new(EnrollmentSlot::default()),
             session: Arc::new(PairingSessionSlot::default()),
             last_prompt_at: Mutex::new(None),
+            lifecycle: Arc::new(Mutex::new(false)),
+            active_prompt: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -337,7 +429,28 @@ impl PairingCoordinator {
     /// code, replacing whatever token (if any) was minted for a previous QR
     /// display.
     pub fn mint_pairing_session_token(&self) -> String {
+        let _cancelled = self.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
         self.session.mint()
+    }
+
+    pub fn invalidate(&self) {
+        let mut cancelled = self.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+        *cancelled = true;
+        *self.session.lock() = None;
+        self.enrollment.clear();
+        self.status.record_outcome(false);
+        *self.active_prompt.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// Cancel invitations/prompts without retiring the running coordinator.
+    /// Used before pause/revoke/permission changes so an old dialog cannot
+    /// add authority after the local user's security decision.
+    pub fn cancel_pending(&self) {
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+        *self.session.lock() = None;
+        self.enrollment.clear();
+        self.status.record_outcome(false);
+        *self.active_prompt.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 
     /// Non-consuming check for the current pairing-session token. See
@@ -351,6 +464,10 @@ impl PairingCoordinator {
     /// has established that a new desktop prompt can actually be shown.
     pub fn pairing_session_claimable(&self, candidate: &str) -> bool {
         self.session.claimable(candidate)
+    }
+
+    pub fn session_device_id(&self, candidate: &str) -> Option<String> {
+        self.session.enrolled_device(candidate)
     }
 
     /// Consumes the current pairing-session token for a state-changing
@@ -368,7 +485,20 @@ impl PairingCoordinator {
     }
 
     pub fn approval_state(&self) -> ApprovalState {
+        self.expire_pending();
         self.status.get()
+    }
+
+    fn expire_pending(&self) {
+        let mut active = self.active_prompt.lock().unwrap_or_else(|p| p.into_inner());
+        if active
+            .as_ref()
+            .is_some_and(|(_, deadline)| Instant::now() >= *deadline)
+        {
+            self.enrollment.clear();
+            self.status.record_outcome(false);
+            *active = None;
+        }
     }
 
     /// Whether the given device id is the enrollment currently awaiting the
@@ -397,7 +527,7 @@ impl PairingCoordinator {
     pub fn request_with_session(
         &self,
         info: PairingRequestInfo,
-        config: SharedConfig,
+        _config: SharedConfig,
         registry: SharedDeviceRegistry,
         pending: Option<PendingEnrollment>,
         pairing_session_token: Option<&str>,
@@ -405,6 +535,15 @@ impl PairingCoordinator {
         let Some(notifier) = self.notifier.clone() else {
             return PairingOutcome::Unavailable;
         };
+        let cancelled = self.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+        if *cancelled {
+            return PairingOutcome::Unavailable;
+        }
+        if registry.lock().map(|r| r.paused()).unwrap_or(true) {
+            return PairingOutcome::Unavailable;
+        }
+
+        self.expire_pending();
 
         // A desktop dialog can outlive the notification-spam cooldown. Never
         // replace its shared enrollment slot while it is unanswered: the old
@@ -437,7 +576,11 @@ impl PairingCoordinator {
         }
 
         if pairing_session_token
-            .map(|token| !self.session.try_consume(token))
+            .map(|token| {
+                !self
+                    .session
+                    .try_consume_for(token, pending.as_ref().map(|p| p.device_id.as_str()))
+            })
             .unwrap_or(false)
         {
             return PairingOutcome::InvalidSession;
@@ -446,19 +589,29 @@ impl PairingCoordinator {
         *last_prompt_at = Some(now);
         drop(last_prompt_at);
 
+        let is_enrollment = pending.is_some();
         if let Some(pending) = pending {
             self.enrollment.set(pending);
         }
 
         self.status.set(ApprovalState::Pending);
+        let prompt_id = uuid::Uuid::new_v4();
+        *self.active_prompt.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some((prompt_id, now + ENROLLMENT_TTL));
         info!(peer = %info.peer, "WakeMATE showing a pairing confirmation prompt on the desktop");
-        notifier(NotifierContext {
+        let context = NotifierContext {
             info,
-            config,
             status: self.status.clone(),
             enrollment: self.enrollment.clone(),
             registry,
-        });
+            lifecycle: self.lifecycle.clone(),
+            active_prompt: self.active_prompt.clone(),
+            prompt_id,
+            expires_at: now + ENROLLMENT_TTL,
+            is_enrollment,
+        };
+        drop(cancelled);
+        notifier(context);
 
         PairingOutcome::AwaitingApproval
     }
@@ -468,6 +621,37 @@ impl PairingCoordinator {
 mod tests {
     use super::*;
     use crate::{config::AppConfig, devices::DeviceRegistry};
+
+    #[test]
+    fn pause_rejects_open_approval_and_cancel_does_not_retire_coordinator() {
+        let (coordinator, context, token) = pending_context();
+        context.registry.lock().unwrap().set_paused(true).unwrap();
+        assert!(context
+            .complete_permissions(Some(Permissions::preset(4)))
+            .is_err());
+        assert_eq!(coordinator.approval_state(), ApprovalState::Denied);
+        context.registry.lock().unwrap().set_paused(false).unwrap();
+        assert_eq!(context.registry.lock().unwrap().authenticate(&token), None);
+        let invitation = coordinator.mint_pairing_session_token();
+        coordinator.cancel_pending();
+        assert!(!coordinator.pairing_session_matches(&invitation));
+        *coordinator.last_prompt_at.lock().unwrap() = None;
+        let fresh = coordinator.mint_pairing_session_token();
+        assert_eq!(
+            coordinator.request_with_session(
+                request_info(),
+                shared_config(),
+                shared_registry(),
+                Some(PendingEnrollment::new("New Phone".into())),
+                Some(&fresh)
+            ),
+            PairingOutcome::AwaitingApproval
+        );
+        assert!(!context
+            .complete_permissions(Some(Permissions::preset(4)))
+            .unwrap());
+        assert_eq!(coordinator.approval_state(), ApprovalState::Pending);
+    }
 
     fn shared_config() -> SharedConfig {
         Arc::new(Mutex::new(AppConfig::default()))
@@ -481,6 +665,124 @@ mod tests {
         PairingRequestInfo {
             peer: "192.168.1.20".parse().unwrap(),
         }
+    }
+
+    fn pending_context() -> (PairingCoordinator, NotifierContext, String) {
+        let captured = Arc::new(Mutex::new(None));
+        let sink = captured.clone();
+        let coordinator = PairingCoordinator::new(Some(Arc::new(move |context| {
+            *sink.lock().unwrap() = Some(context);
+        })));
+        let pending = PendingEnrollment::new("Phone".into());
+        let token = pending.token.clone();
+        coordinator.request(
+            request_info(),
+            shared_config(),
+            shared_registry(),
+            Some(pending),
+        );
+        let context = captured.lock().unwrap().take().unwrap();
+        (coordinator, context, token)
+    }
+
+    #[test]
+    fn invalidation_cancels_qr_pending_callbacks_and_future_requests() {
+        let (coordinator, context, token) = pending_context();
+        let qr = coordinator.mint_pairing_session_token();
+        coordinator.invalidate();
+        assert!(!coordinator.pairing_session_matches(&qr));
+        assert!(!context
+            .complete_permissions(Some(Permissions::preset(4)))
+            .unwrap());
+        assert_eq!(context.registry.lock().unwrap().authenticate(&token), None);
+        assert_eq!(
+            coordinator.request(request_info(), shared_config(), shared_registry(), None),
+            PairingOutcome::Unavailable
+        );
+    }
+
+    #[test]
+    fn expired_dialog_never_grants_capabilities_or_registers_device() {
+        let (coordinator, mut context, token) = pending_context();
+        context.expires_at = Instant::now();
+        assert!(!context
+            .complete_permissions(Some(Permissions::preset(4)))
+            .unwrap());
+        assert_eq!(coordinator.approval_state(), ApprovalState::Denied);
+        assert_eq!(context.registry.lock().unwrap().authenticate(&token), None);
+    }
+
+    #[test]
+    fn approval_grants_only_selected_permissions_in_one_record() {
+        let (coordinator, context, token) = pending_context();
+        assert!(context
+            .complete_permissions(Some(Permissions::default()))
+            .unwrap());
+        assert_eq!(coordinator.approval_state(), ApprovalState::Approved);
+        let registry = context.registry.lock().unwrap();
+        let id = registry.authenticate(&token).unwrap();
+        assert_eq!(registry.permissions(&id), Some(Permissions::default()));
+        assert!(!registry.allows(&id, crate::devices::Capability::Input));
+    }
+
+    #[test]
+    fn completion_saves_before_publishing_and_denial_does_not_write() {
+        let (coordinator, context, token) = pending_context();
+        assert_eq!(context.registry.lock().unwrap().authenticate(&token), None);
+        assert!(context
+            .complete_permissions(Some(Permissions::preset(4)))
+            .unwrap());
+        assert_eq!(coordinator.approval_state(), ApprovalState::Approved);
+        assert!(context
+            .registry
+            .lock()
+            .unwrap()
+            .authenticate(&token)
+            .is_some());
+        let (_, denied, token) = pending_context();
+        assert!(!denied.complete_permissions(None).unwrap());
+        assert_eq!(denied.registry.lock().unwrap().authenticate(&token), None);
+    }
+
+    #[test]
+    fn registry_failure_rolls_back_capabilities_and_reports_denial() {
+        let (coordinator, context, token) = pending_context();
+        let dir = std::env::temp_dir().join(format!(
+            "wakemate-approval-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        *context.registry.lock().unwrap() =
+            DeviceRegistry::load_from_path(blocker.join("devices.json"));
+        assert!(context
+            .complete_permissions(Some(Permissions::preset(4)))
+            .is_err());
+        assert_eq!(coordinator.approval_state(), ApprovalState::Denied);
+        assert_eq!(context.registry.lock().unwrap().authenticate(&token), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn timeout_releases_reservation_and_old_callback_cannot_approve_new_phone() {
+        let (coordinator, old, _) = pending_context();
+        *coordinator.active_prompt.lock().unwrap() = Some((old.prompt_id, Instant::now()));
+        *coordinator.last_prompt_at.lock().unwrap() = None;
+        assert_eq!(coordinator.approval_state(), ApprovalState::Denied);
+        assert_eq!(
+            coordinator.request(
+                request_info(),
+                shared_config(),
+                shared_registry(),
+                Some(PendingEnrollment::new("New Phone".into()))
+            ),
+            PairingOutcome::AwaitingApproval
+        );
+        assert!(!old
+            .complete_permissions(Some(Permissions::preset(4)))
+            .unwrap());
+        assert_eq!(coordinator.approval_state(), ApprovalState::Pending);
     }
 
     #[test]
@@ -513,11 +815,12 @@ mod tests {
         let coordinator = PairingCoordinator::new(Some(Arc::new(|context: NotifierContext| {
             // Simulate the desktop user clicking "Yes".
             let pending = context.enrollment.take_valid().expect("enrollment queued");
-            context.registry.lock().unwrap().register_with_id(
-                &pending.device_id,
-                &pending.device_name,
-                &pending.token,
-            );
+            context
+                .registry
+                .lock()
+                .unwrap()
+                .register_with_id(&pending.device_id, &pending.device_name, &pending.token)
+                .unwrap();
             context.status.record_outcome(true);
         })));
 
@@ -641,11 +944,7 @@ mod tests {
         *coordinator
             .last_prompt_at
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) = Some(
-            Instant::now()
-                .checked_sub(PROMPT_COOLDOWN + Duration::from_secs(1))
-                .unwrap(),
-        );
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
 
         let still_busy = coordinator.request_with_session(
             request_info(),
@@ -678,9 +977,7 @@ mod tests {
     fn expired_enrollment_cannot_be_taken() {
         let slot = EnrollmentSlot::default();
         let mut pending = PendingEnrollment::new("Old Phone".to_string());
-        pending.requested_at = Instant::now()
-            .checked_sub(ENROLLMENT_TTL + Duration::from_secs(1))
-            .unwrap();
+        pending.expires_at = Instant::now();
         let device_id = pending.device_id.clone();
         slot.set(pending);
 
@@ -699,7 +996,10 @@ mod tests {
         assert!(slot.holds(&device_id));
         assert!(!registry.lock().unwrap().contains(&device_id));
 
-        let committed = slot.commit_valid(&registry).expect("valid enrollment");
+        let committed = slot
+            .commit_valid(&registry)
+            .unwrap()
+            .expect("valid enrollment");
         assert_eq!(committed.device_id, device_id);
         assert!(registry.lock().unwrap().contains(&device_id));
         assert!(!slot.holds(&device_id));
@@ -756,9 +1056,7 @@ mod tests {
         let slot = PairingSessionSlot::default();
         let token = slot.mint();
         if let Some(session) = slot.lock().as_mut() {
-            session.minted_at = Instant::now()
-                .checked_sub(PAIRING_SESSION_TTL + Duration::from_secs(1))
-                .unwrap();
+            session.expires_at = Instant::now();
         }
 
         assert!(!slot.matches(&token));

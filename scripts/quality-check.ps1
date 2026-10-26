@@ -12,6 +12,9 @@ $repoRoot = Resolve-Path (Join-Path $PSScriptRoot '..')
 
 Push-Location $repoRoot
 try {
+    # Use the same validated compiler/headers as the release helper.
+    . (Join-Path $repoRoot 'build-release.ps1') -EnvironmentOnly
+
     Write-Host '==> cargo fmt --check' -ForegroundColor Cyan
     cargo fmt --all -- --check
     if ($LASTEXITCODE -ne 0) { throw 'cargo fmt found unformatted code. Run "cargo fmt --all" to fix it.' }

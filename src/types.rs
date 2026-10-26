@@ -10,7 +10,9 @@ pub const AUTH_HEADER: &str = "x-wakemate-token";
 /// 3 = adds `/v1/pairing/enroll` per-device tokens and the `device_id` query
 /// on `/v1/pairing/status`; 4 = adds the `security_screen` command and stops
 /// accepting `ctrl+alt+delete` as a `key_press`.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// 5 = HTTPS-only authenticated transport, invitation-only enrollment, and
+/// per-device permissions. Permanent shared control tokens are retired.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Debug, Serialize)]
 pub struct ApiResponse<T: Serialize> {

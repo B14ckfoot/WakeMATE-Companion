@@ -1,52 +1,80 @@
-# Troubleshooting
+# Troubleshooting WakeMATE 0.3
 
-## Where to look first
+## The installer finished, but no tray icon appeared
 
-- **Logs**: WakeMATE logs to stdout/stderr via `tracing`. The tray app doesn't keep a console window open, so redirect it if you need to capture logs interactively:
-  `wakemate-companion.exe > wakemate.log 2>&1` (or set `RUST_LOG=debug` first for more detail; see `.env.example`).
-- **Config / data folder**: use the tray menu's "Open Data Folder", or go directly to `%APPDATA%\WakeMATE Companion\` on Windows (`~/Library/Application Support/WakeMATE Companion/` on macOS). `wakemate.config.json` there is safe to inspect -- the pairing token itself is not stored in it once migrated to the OS credential store (see below).
+This is expected: Setup never launches the companion or initializes an administrator's user profile. Close Setup and open **WakeMATE Companion** from Start as your normal user. Do not run the app as administrator. Complete the native settings/consent flow before pairing a phone.
 
-## "Unauthorized" / 401 from the mobile app
+An existing older configuration also needs the protocol 5 consent step. Until that completes, listeners are local-only and discovery is off.
 
-- Confirm the phone has the current token. Rotating the token (tray menu) invalidates every previously paired phone at once.
-- Check `x-wakemate-token` is being sent exactly as configured; comparison is exact and case-sensitive.
+## The phone cannot find this computer
 
-## "Too many failed attempts" / 429 responses
+1. Open **Settings → Open Settings...** from the tray and select the intended live private adapter.
+2. Enable private network access. Ensure both devices are on a reachable home LAN; guest Wi-Fi/client isolation can prevent direct communication.
+3. Read the connection status in Settings. HTTPS and discovery report their actual readiness separately. Use **Restart Connection** after fixing an adapter or port conflict.
+4. Check Windows Firewall's Private-profile rules for this installed executable. The installer creates TCP `7778` and UDP `41234` rules limited to LocalSubnet. Public-profile networks do not receive those rules.
 
-WakeMATE locks out a source IP for 60 seconds after 8 failed authentication attempts against any authenticated endpoint within a 60-second window (see `src/security.rs`). This is expected behavior if:
+Do not enable public access, router forwarding, or an unrestricted firewall exception to fix discovery. Custom ports require corresponding narrowly scoped firewall rules; the installer rules cover the defaults. HTTPS can be ready while UDP discovery is unavailable.
 
-- A phone is retrying with a stale/incorrect token in a loop.
-- Something on your network is scanning/probing the API.
+If a chosen adapter's IP changed, choose its current address in Settings and restart the connection. A selected stale address is not silently replaced by all interfaces. The phone's saved certificate pin remains the computer identity when its IP changes.
 
-Wait 60 seconds, fix the token, and try again. There is no way to clear the lockout early short of restarting the Companion (the lockout state is in-memory and per-process).
+## Secure pairing is missing or invalid
 
-## The mobile app says "Success" but remote control still doesn't work
+Update the companion and phone app, display a fresh QR from the companion tray, and scan it again from **Add device → Scan QR**. HTTP-only pairings and partial/malformed TLS metadata cannot authorize commands. Discovery cannot repair or replace a missing certificate pin.
 
-This is a known, intentional consequence of the pairing-confirmation hardening (see `docs/SECURITY_MODEL.md`): `/v1/pairing/activate` responds immediately (so the phone doesn't hit its own request timeout) with `status: "pending_approval"`, but `allow_input_commands`/`allow_power_commands` only actually flip to `true` after someone clicks "Yes" on the native desktop confirmation dialog. If that dialog never appeared:
+If the message says secure storage is unavailable, unlock the phone and reopen WakeMATE. A locked keychain is not an expired pairing and does not erase the saved pin. If the error persists, resolve secure storage/native-build availability before scanning again.
 
-- Confirm the WakeMATE tray app is actually running on the target desktop (not just installed). No dialog is possible without it.
-- Confirm Windows is signed in. Current builds intentionally run Companion networking only in the normal-user tray process; Wake-on-LAN can still be sent directly by the phone before sign-in, but pairing and remote control require the tray.
-- Check for a dialog that appeared behind another window; it's always-on-top and foreground-activated, but alt-tab if you don't see it.
+Expo Go cannot provide WakeMATE's native certificate-pinning module. Development requires a current native build; restarting Metro alone does not install native code.
 
-## "Windows Credential Manager" / token storage questions
+A certificate mismatch is a real identity failure. Verify that the QR is displayed on the intended computer. Do not disable certificate checks. Re-scan deliberately if that computer's TLS identity was intentionally replaced.
 
-- WakeMATE stores the pairing token as a Generic Credential under Windows Credential Manager, target name `pairing-token.WakeMATE Companion`. You can inspect (but not read the secret value of) it via Control Panel -> Credential Manager -> Windows Credentials, or `cmdkey /list`.
-- If the credential store is unavailable for any reason (locked-down environment, corporate policy, etc.), WakeMATE falls back to storing the token in the plaintext config file and sets `"token_storage": "file"` there so this is never silent. Check the logs for a `OS credential store unavailable` warning.
-- Deleting the Credential Manager entry externally (or profile corruption) causes WakeMATE to mint a brand-new token on next start, silently invalidating any paired phones -- this is intentional fail-safe behavior (never running with an empty/no token) but will require re-pairing.
+## Pairing waits, is denied, or times out
 
-## Port already in use / server won't start
+Keep the desktop prompt visible and approve only the phone you just scanned. Select the permissions you intend to grant. The prompt expires after two minutes; a QR invitation expires after ten minutes and can enroll only once. If denied, expired, or busy, close the old request and generate a fresh QR.
 
-WakeMATE binds `7777` by default (configurable via `bind_address`) and HTTPS on `7778` by default. If another process holds an enabled listener port, the tray reports a server error instead of silently treating that process as WakeMATE. Close the conflicting process or change the configured port, then restart WakeMATE. The single-instance lock makes a second tray launch exit quietly.
+The mobile app stages the new credential before waiting, so suspension/resume can recover an approval. A pending request is not success. Protocol 5 never falls back to shared-token activation to obtain missing permissions.
 
-## Uninstalling and removing local data
+## Pairing succeeded, but a control is denied
 
-The Windows uninstaller removes the installed program files, Start Menu shortcuts, the startup Run-key registration, and any retired pre-logon task left by an older release. It deliberately does **not** delete `%APPDATA%\WakeMATE Companion\` or the Windows Credential Manager entry, so a reinstall doesn't force re-pairing.
+Open **Paired Devices → phone → Permissions...** on the computer. A status/wake-only grant is a successful pairing. Media, desktop input, and power require the corresponding desktop-selected preset. The phone cannot enlarge its own grant.
 
-To fully wipe local WakeMATE data (no cloud account is affected either way):
+Desktop control is broad access to the signed-in account. Grant it only when you trust the phone to operate that account; withholding a power button does not constrain what keyboard/mouse access can do.
 
-1. Run "Reset Companion..." from the tray before uninstalling (clears the stored token and all local settings), **or**
-2. After uninstalling, manually delete `%APPDATA%\WakeMATE Companion\` and remove the `pairing-token.WakeMATE Companion` entry from Credential Manager.
+If **Pause Remote Access** is checked, resume deliberately to restore the existing grants. Repeated rejected credentials can trigger a temporary lockout; wait, then fix the pairing rather than retrying rapidly.
 
-## macOS / Linux
+## Input stopped, a drag ended, or Windows rejected a command
 
-See `docs/MACOS_BUILD.md` for the current state (headless service only, no tray/pairing UI yet) before troubleshooting a macOS build -- most "nothing shows up" reports there are expected given today's scope.
+Held mouse buttons expire after a two-second lease. Pause, revoke, connection restart, and shutdown cancel queued input and release owned synthetic state. Text requests have a 1024-character limit and execute in short chunks. A full queue rejects more work instead of growing indefinitely.
+
+Windows may refuse input into elevated applications, security prompts, another session, or the secure desktop. WakeMATE reports insertion failures; it does not bypass those restrictions. Ctrl+Alt+Delete cannot be sent as a keyboard shortcut. The separate security-screen action reports its actual supported result or the explicitly chosen lock fallback.
+
+Use **Pause Remote Access** to stop remote work, then verify the local desktop state. Already emitted input cannot be undone automatically. A physical key held by the local user must not be treated as synthetic state to release.
+
+## The registry or settings could not be saved
+
+Stop relying on the failed permission/revocation/pause change until storage is repaired. The current process denies authorization after a registry persistence failure, but a failed write cannot prove the change survives restart.
+
+Open **Settings → Open Data Folder** and preserve the files and error details. Check that the normal Windows user can write their own app-data folder. Corrupt configuration is backed up and recovered local-only; unreadable settings or invalid preferred-adapter values fail without being overwritten. Corrupt device storage pauses access.
+
+**Reset Companion...** is the explicit recovery path after storage is repaired. It clears approvals and network consent and returns to guided setup. Every phone must pair again. It retains the persistent TLS identity. Do not delete or regenerate `wakemate.tls.json` as a routine connectivity fix.
+
+## Wake works only after sign-in, or never wakes the PC
+
+The companion has no pre-login Windows server. The phone sends Wake-on-LAN directly while the computer is asleep; status/control start only after Windows sign-in and normal-user startup. Check firmware/adapter wake support and the saved MAC/broadcast address. Sending a packet does not prove the computer woke.
+
+A relay through another running companion needs its wake grant. Public health or an unauthenticated discovery response does not authorize a relay.
+
+## Another copy/session is already running
+
+Use the tray in the owning Windows session to quit or restart the installed copy. Do not start development and installed copies against the same ports or force-kill every process with the same filename. The app must not control a different user's desktop. Installer/session-switch behavior still needs clean-VM and multi-user QA.
+
+## Uninstall left data or an old credential entry
+
+Retaining user data is intentional. Revoke/reset from the tray before uninstalling when you want to clear phone approvals. Then uninstall through Windows Settings. Verify startup entries in each Windows account that used the companion, especially after over-the-shoulder administrator installation of older versions.
+
+The app-data folder retains the TLS identity/config/device registry. An older Windows Credential Manager `WakeMATE Companion` / `pairing-token` entry is unused by protocol 5 and may be removed manually there. Never send its value or a pairing QR/token in a support request.
+
+## Build or release problems
+
+Use the MSVC-aware [Windows build workflow](WINDOWS_BUILD.md), not a bare shell with missing compiler headers. Run the full quality gate before packaging. The installer helper rejects changed source, changed executables, mismatched versions, or an invalid runtime redistributable signature; rebuild rather than bypassing provenance checks.
+
+Use the newly reported packaging output directory and its checksum/provenance files. Old `dist` installers can share a version number with different source generations. Automated tests and successful packaging do not replace [clean-VM and physical-phone release QA](RELEASE_CHECKLIST.md). macOS is still a [developer preview](MACOS_BUILD.md).

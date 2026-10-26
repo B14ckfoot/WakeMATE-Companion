@@ -1,32 +1,19 @@
 ---
 paths:
-  - "src/app.rs"
-  - "src/config.rs"
-  - "src/credential_store.rs"
-  - "src/devices.rs"
-  - "src/discovery.rs"
-  - "src/input.rs"
-  - "src/main.rs"
-  - "src/pairing.rs"
-  - "src/pairing_qr.rs"
-  - "src/secure_attention.rs"
-  - "src/security.rs"
-  - "src/system.rs"
-  - "src/tls.rs"
-  - "src/types.rs"
+  - "src/**/*.rs"
   - "wakemate.config.example.json"
   - "docs/SECURITY_MODEL.md"
+  - "docs/PROTOCOL5_MIGRATION.md"
 ---
 
-# Companion security
+# Protocol and security invariants
 
-- Start protocol or authorization work with a threat-boundary review: identify the caller credential, trust channel, endpoint class, runtime privilege, capability gate, replay behavior, rate limit, and failure response.
-- Keep public health, authenticated info/wake, pairing enrollment/status, input, and power routes deliberately separate. Network reachability is never authorization.
-- New pairing requires an interactive desktop approval. Per-device tokens authenticate only approved devices; they must not mint other device tokens. Preserve revocation and shared-token rotation semantics.
-- Compare sensitive tokens in constant time and retain per-IP failure tracking/lockout. Do not log raw tokens or certificate keys.
-- Store enrollment secrets in the OS credential store when available and report fallback honestly. Store only per-device token hashes on disk. Preserve safe write-before-delete and atomic migration ordering.
-- Preserve the persistent TLS identity and lowercase SHA-256 leaf fingerprint. Reject corrupt identity; never silently rotate it or downgrade a pinned client to HTTP.
-- Treat config, JSON bodies, query fields, discovery probes, MAC/IP/port values, command enums, and device metadata as untrusted. Reject unknown or malformed commands instead of guessing.
-- Require approved capability checks before input or power execution. Pre-login mode must refuse pairing and input; do not widen elevated capabilities casually.
-- Never fake Ctrl+Alt+Delete. Keep Secure Attention Sequence and other unsupported/permission-gated actions structured and truthful, including fallback reporting.
-- Add/update tests for changed authentication, pairing, revocation, parsing, status, command authorization, config migration, rate limiting, or certificate behavior, and review the mobile contract in parallel.
+- Review caller credential, trust channel, endpoint class, selected grant, persistence, replay/expiry, and failure response before changing authorization.
+- Protocol 5 has no permanent shared credential/keyring runtime. QR-session tokens enroll/poll only their own session; approved-device tokens cannot enroll phones. Reject legacy activation.
+- Authenticated APIs use pinned HTTPS; optional HTTP exposes credential-free public health only. Discovery is untrusted metadata. Keep exact persistent leaf-certificate pinning and reject corrupt TLS identity rather than silently regenerating it.
+- Require native desktop approval and per-phone grants. Default status/wake; check media, input, and power independently. Explain that keyboard/mouse gives broad signed-in-account control.
+- Persist hashes, permissions, pause, and generation atomically. Failed writes deny access and surface errors; a failed revoke/pause is not proof of durable success. Corrupt storage must preserve evidence and fail closed.
+- Invalidate pending approvals and cancel stale input on permission changes, pause, revoke, reset, restart, and shutdown. Check live authorization at execution, not just request admission.
+- Keep one bounded input worker: queue 32, text limit 1024 characters, short cancellable chunks, owned held-button lease/cleanup, and checked OS insertion counts. Preserve physical modifiers and truthful partial/failure results.
+- Keep constant-time secret/hash comparisons, authentication lockout, validated bodies/commands/addresses/ports, Origin rejection, and non-cacheable API responses. Never log tokens/private keys.
+- Test changed parsing, grants, persistence failures, expiry, revocation, pinning, and input cancellation using injected boundaries. Review every affected mobile producer/consumer.

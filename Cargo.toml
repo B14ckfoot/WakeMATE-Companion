@@ -1,6 +1,6 @@
 [package]
 name = "wakemate-companion"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2021"
 description = "WakeMATE desktop companion for device discovery, Wake-on-LAN, and remote input control"
 
@@ -10,8 +10,6 @@ winres = "0.1"
 [dependencies]
 axum = { version = "0.7", features = ["macros"] }
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
-enigo = "0.1"
-keyring = { version = "3", features = ["windows-native", "apple-native"] }
 network-interface = "2"
 pem = "3"
 rcgen = "0.14"
@@ -25,11 +23,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 font8x8 = "0.3"
 image = { version = "0.25", default-features = false, features = ["ico", "png"] }
 qrcodegen = "1.8"
-softbuffer = "0.4"
+softbuffer = { version = "0.4", default-features = false }
 tray-icon = "0.22"
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
-winit = "0.30"
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Memory", "Win32_System_Power", "Win32_System_Shutdown", "Win32_System_SystemInformation", "Win32_System_RemoteDesktop", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Controls", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_TextServices", "Win32_UI_WindowsAndMessaging"] }
+# The tray is Windows-only; do not resolve unused Linux display backends.
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }

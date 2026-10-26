@@ -1,28 +1,32 @@
 ---
 paths:
   - "src/tray.rs"
+  - "src/desktop.rs"
   - "src/system.rs"
+  - "src/network.rs"
+  - "src/runtime_status.rs"
+  - "src/windows_input.rs"
+  - "src/input_executor.rs"
   - "src/secure_attention.rs"
-  - "src/input.rs"
   - "src/main.rs"
   - "build.rs"
   - "build-release.ps1"
   - "scripts/**/*.ps1"
   - "installer/**/*.ps1"
   - "installer/**/*.iss"
-  - "installer/branding/**/*"
-  - "installer/redist/**/*"
-  - "assets/**/*"
   - "docs/WINDOWS_BUILD.md"
   - "docs/TROUBLESHOOTING.md"
 ---
 
-# Windows platform
+# Windows lifecycle
 
-- Keep the interactive companion running as the normal user. Use administrator privileges only for machine-scoped install, prerequisites, firewall configuration, or cleanup of legacy installer state.
-- Keep startup registration user-scoped and safely quoted. Do not register a SYSTEM pre-login server: direct phone Wake-on-LAN works without one, while user-scoped tokens, TLS identity, and paired devices must stay in the interactive user's security context. Remove the retired scheduled task during upgrade/uninstall.
-- Limit inbound firewall access to the intended local/private-network behavior and companion executable; do not broaden profiles, ports, or programs without explicit security review.
-- Preserve installer upgrade behavior and existing config/credential/TLS state. Uninstall must clean installed files, startup registration, scheduled tasks, and firewall rules without claiming retained app data was erased.
-- Do not claim unsigned binaries are trusted or advise bypassing SmartScreen/antivirus. Authenticode needs real protected credentials, timestamps, and verification.
-- Ctrl+Alt+Delete is the Windows Secure Attention Sequence: never inject it as keystrokes or bypass UAC/policy. Report `unsupported` or `permission_required`, and perform only an explicitly requested safe fallback.
-- Keep Windows APIs and dependencies behind appropriate `cfg(target_os = "windows")` guards and retain tests for quoting, command classification, tray behavior, and cleanup-sensitive changes.
+- Run the companion as a normal interactive user and refuse elevated/service contexts before loading state. One owning session controls the listeners/desktop; other accounts must not receive remote input.
+- Setup performs machine installation only and never launches the tray or initializes another account's per-user state. Normal Start-menu launch handles native setup and user startup registration.
+- Require onboarding consent before LAN bind/discovery. Preserve explicit private adapter selection; invalid values fail without widening the bind, and stale addresses report failure.
+- Keep private LocalSubnet, installed-executable, protocol/port-scoped firewall rules. Report HTTPS and UDP readiness separately; do not advertise readiness before bind succeeds.
+- No SYSTEM pre-login API. Retired headless tasks exit without reading user state/listening. Direct phone Wake-on-LAN remains available independently.
+- Keep startup entries safely quoted/user-scoped. Upgrade/shutdown must target the installed path and stop gracefully, preserving development copies and unrelated processes.
+- Pause/revoke/reset and session/security-desktop transitions cancel queued/held input. Checked `SendInput` is not a route around UAC, physical modifiers, secure desktop, or Secure Attention Sequence policy.
+- Do not synthesize Ctrl+Alt+Delete. Return structured unsupported/permission/failure results and perform only explicitly requested supported fallbacks.
+- Preserve upgrade data and document retained state. Verify multi-user startup/uninstall cleanup in a clean VM. Unsigned binaries remain unsigned; never advise disabling Windows protections.
+- Keep Windows APIs behind compile-time guards and unit tests free of real desktop input, installed configuration, or OS credential mutations.

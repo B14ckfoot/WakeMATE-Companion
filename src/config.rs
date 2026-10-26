@@ -3,6 +3,7 @@ use std::{
     fs::OpenOptions,
     io,
     io::Write,
+    net::Ipv4Addr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -11,8 +12,6 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::credential_store;
-
 pub type SharedConfig = Arc<Mutex<AppConfig>>;
 
 const APP_DIR_NAME: &str = "WakeMATE Companion";
@@ -20,64 +19,45 @@ const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0:7777";
 const DEFAULT_TLS_PORT: u16 = 7778;
 const DEFAULT_DISCOVERY_MESSAGE: &str = "wakemate:discover";
 
-/// Records where the pairing token currently lives so the UI can be honest
-/// about it and so `save_to_path` knows whether it is safe to omit the
-/// secret from the on-disk config file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum TokenStorage {
-    /// Windows Credential Manager / macOS Keychain / platform keyring.
-    Keyring,
-    /// Fallback: kept in the plaintext config file because the OS
-    /// credential store was unavailable on this machine.
-    #[default]
-    File,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub bind_address: String,
-    /// HTTPS always listens on this port. `bind_address` keeps its original
-    /// HTTP port for the one-release migration window.
+    /// HTTPS always listens on this port. `bind_address` retains the optional
+    /// credential-free legacy HTTP health port.
     pub tls_port: u16,
-    /// Transitional compatibility switch. Set false after all paired phones
-    /// have scanned a TLS-capable QR code.
+    /// Opt-in public health compatibility only. Authenticated routes are
+    /// never available through this listener, including on upgraded installs.
     pub allow_insecure_http: bool,
     pub discovery_port: u16,
     pub discovery_message: String,
-    /// In-memory pairing token. When `token_storage` is `Keyring` this is
-    /// hydrated from the OS credential store at load time and blanked out
-    /// before the struct is written back to disk; see `hydrate_token` and
-    /// `save_to_path`.
-    pub api_token: String,
-    pub token_storage: TokenStorage,
     pub device_name: String,
     pub launch_on_startup: bool,
-    pub allow_input_commands: bool,
-    pub allow_power_commands: bool,
+    /// LAN operation requires explicit consent in the interactive tray. An
+    /// older file without this field must complete the new onboarding flow.
+    pub onboarding_completed: bool,
+    /// Optional private adapter address selected by the desktop user. A stale
+    /// selection causes a visible bind failure instead of widening the bind.
+    pub preferred_address: Option<String>,
     pub allow_remote_connections: bool,
     pub allow_discovery: bool,
-    pub require_auth_for_info: bool,
 }
 
 impl AppConfig {
     pub fn prepare_install_config_at_path(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let new_install = !path.try_exists()?;
         let mut config = Self::load_or_create_from_path(path)?;
-        config.apply_install_posture();
+        if new_install {
+            config.apply_install_posture();
+        }
         config.save_to_path(path)?;
         Ok(config)
     }
 
-    /// The settings an installed companion needs so a phone can pair by
-    /// scanning the QR code with no manual setup: reachable from the LAN,
-    /// discoverable, and running after reboots. Command capabilities are
-    /// deliberately NOT granted here -- those flip on when the person at the
-    /// desktop approves the pairing prompt.
+    /// Installation may arrange normal-user startup. It cannot provide the
+    /// interactive user's consent to network exposure or device permissions.
     fn apply_install_posture(&mut self) {
         self.launch_on_startup = true;
-        self.allow_remote_connections = true;
-        self.allow_discovery = true;
     }
 
     pub fn load_or_create() -> Result<Self, Box<dyn std::error::Error>> {
@@ -86,45 +66,29 @@ impl AppConfig {
     }
 
     pub fn load_or_create_from_path(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let (mut config, recovered_from_error) = match fs::read_to_string(path) {
+        let (config, recovered_from_error) = match fs::read_to_string(path) {
             Ok(raw) => match serde_json::from_str::<Self>(&raw) {
                 Ok(mut config) => {
-                    config.normalize();
+                    config.normalize()?;
                     (config, false)
                 }
                 Err(error) => {
                     warn!(
                         %error,
                         path = %path.display(),
-                        "WakeMATE config file is corrupt; resetting to defaults"
+                        "WakeMATE config file is corrupt; preserving it and using local-only defaults"
                     );
+                    let backup = path.with_extension(format!("{}.corrupt", Uuid::new_v4()));
+                    fs::copy(path, backup)?;
                     (Self::default(), true)
                 }
             },
             Err(error) if error.kind() == io::ErrorKind::NotFound => (Self::default(), false),
             Err(error) => {
-                // An unreadable config must not be a fatal startup error:
-                // this binary has no console to report one. Use defaults
-                // even if the repair write below also fails.
-                warn!(
-                    %error,
-                    path = %path.display(),
-                    "WakeMATE config file is unreadable; resetting to defaults"
-                );
-                (Self::default(), true)
+                return Err(error.into());
             }
         };
 
-        // A config file that existed but could not be read means this machine
-        // already went through setup. Recovering to the locked-down defaults
-        // would silently strand paired phones on a localhost-only server, so
-        // recovery restores the reachable install posture instead. Command
-        // capabilities still require a fresh pairing approval.
-        if recovered_from_error {
-            config.apply_install_posture();
-        }
-
-        config.hydrate_token();
         if let Err(error) = config.save_to_path(path) {
             if recovered_from_error {
                 warn!(
@@ -139,53 +103,11 @@ impl AppConfig {
         Ok(config)
     }
 
-    /// Resolves the active pairing token, preferring the OS credential store.
-    ///
-    /// - If the credential store already has an entry, it wins (it is the
-    ///   source of truth once migration has happened).
-    /// - Otherwise, whatever is already in `self.api_token` is used (a fresh
-    ///   UUID for a brand new config, or a legacy plaintext value read from
-    ///   an older config file) and an attempt is made to migrate it into the
-    ///   credential store.
-    /// - If the credential store is unavailable on this machine, the token
-    ///   stays in the config file and that fact is recorded in
-    ///   `token_storage` so the UI can surface it honestly.
-    fn hydrate_token(&mut self) {
-        if let Some(token) = credential_store::load_token() {
-            self.api_token = token;
-            self.token_storage = TokenStorage::Keyring;
-            return;
-        }
-
-        let token = if self.api_token.trim().is_empty() {
-            Uuid::new_v4().to_string()
-        } else {
-            self.api_token.clone()
-        };
-
-        match credential_store::store_token(&token) {
-            Ok(()) => {
-                self.api_token = token;
-                self.token_storage = TokenStorage::Keyring;
-            }
-            Err(error) => {
-                warn!(
-                    %error,
-                    "OS credential store unavailable; keeping the pairing token in the config file"
-                );
-                self.api_token = token;
-                self.token_storage = TokenStorage::File;
-            }
-        }
-    }
-
-    /// Clears all local state (including the stored pairing token) and
-    /// starts over with fresh secure defaults. This only touches local
-    /// device state -- WakeMATE has no cloud account to sign out of.
+    /// Restores local preferences and network consent to secure defaults.
+    /// Device registry revocation is a separate durable transaction at the
+    /// caller; protocol 5 has no permanent shared credential to rotate.
     pub fn reset_to_defaults(&mut self) {
-        credential_store::delete_token();
         *self = Self::default();
-        self.hydrate_token();
     }
 
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -198,14 +120,9 @@ impl AppConfig {
             fs::create_dir_all(parent)?;
         }
 
-        // Once the token lives in the OS credential store there is no
-        // reason for a plaintext copy to also sit in the config file.
-        let mut on_disk = self.clone();
-        if on_disk.token_storage == TokenStorage::Keyring {
-            on_disk.api_token = String::new();
-        }
-
-        let json = serde_json::to_string_pretty(&on_disk)?;
+        // Legacy shared credentials and process-wide capability flags are
+        // unknown fields on load and deliberately absent from this schema.
+        let json = serde_json::to_string_pretty(self)?;
 
         // Write and flush a uniquely named sibling before atomically replacing
         // the real config. A killed process can leave an incomplete temp file,
@@ -216,10 +133,14 @@ impl AppConfig {
         let tmp_path = path.with_file_name(tmp_name);
 
         let write_result = (|| -> io::Result<()> {
-            let mut tmp_file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path)?;
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut tmp_file = options.open(&tmp_path)?;
             tmp_file.write_all(json.as_bytes())?;
             tmp_file.sync_all()?;
             drop(tmp_file);
@@ -268,8 +189,11 @@ impl AppConfig {
     }
 
     pub fn effective_bind_address(&self) -> String {
-        if self.allow_remote_connections {
-            self.bind_address.clone()
+        if self.onboarding_completed && self.allow_remote_connections {
+            self.preferred_address
+                .as_ref()
+                .map(|address| format!("{address}:{}", self.bind_port()))
+                .unwrap_or_else(|| self.bind_address.clone())
         } else {
             format!("127.0.0.1:{}", self.bind_port())
         }
@@ -285,31 +209,10 @@ impl AppConfig {
     }
 
     pub fn discovery_enabled(&self) -> bool {
-        self.allow_remote_connections && self.allow_discovery
+        self.onboarding_completed && self.allow_remote_connections && self.allow_discovery
     }
 
-    /// Rotates the pairing token, preferring to store the new value in the
-    /// OS credential store. Returns the new token; callers are expected to
-    /// call `save()` afterwards as with any other config change.
-    pub fn rotate_api_token(&mut self) -> String {
-        let new_token = Uuid::new_v4().to_string();
-
-        match credential_store::store_token(&new_token) {
-            Ok(()) => self.token_storage = TokenStorage::Keyring,
-            Err(error) => {
-                warn!(
-                    %error,
-                    "OS credential store unavailable; rotated token will be kept in the config file"
-                );
-                self.token_storage = TokenStorage::File;
-            }
-        }
-
-        self.api_token = new_token.clone();
-        new_token
-    }
-
-    fn normalize(&mut self) {
+    fn normalize(&mut self) -> io::Result<()> {
         if self.bind_address.trim().is_empty() {
             self.bind_address = DEFAULT_BIND_ADDRESS.to_string();
         }
@@ -325,6 +228,23 @@ impl AppConfig {
         if self.device_name.trim().is_empty() {
             self.device_name = detect_device_name();
         }
+
+        if let Some(address) = &self.preferred_address {
+            let parsed = address.trim().parse::<Ipv4Addr>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "The selected network adapter must be a private IPv4 address.",
+                )
+            })?;
+            if !parsed.is_private() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "The selected network adapter must be a private IPv4 address.",
+                ));
+            }
+            self.preferred_address = Some(parsed.to_string());
+        }
+        Ok(())
     }
 }
 
@@ -333,18 +253,15 @@ impl Default for AppConfig {
         Self {
             bind_address: DEFAULT_BIND_ADDRESS.to_string(),
             tls_port: DEFAULT_TLS_PORT,
-            allow_insecure_http: true,
+            allow_insecure_http: false,
             discovery_port: 41234,
             discovery_message: DEFAULT_DISCOVERY_MESSAGE.to_string(),
-            api_token: String::new(),
-            token_storage: TokenStorage::default(),
             device_name: detect_device_name(),
             launch_on_startup: true,
-            allow_input_commands: false,
-            allow_power_commands: false,
+            onboarding_completed: false,
+            preferred_address: None,
             allow_remote_connections: false,
             allow_discovery: false,
-            require_auth_for_info: true,
         }
     }
 }
@@ -388,8 +305,7 @@ fn home_dir() -> io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, TokenStorage, DEFAULT_BIND_ADDRESS};
-    use crate::credential_store;
+    use super::{AppConfig, DEFAULT_BIND_ADDRESS};
 
     #[test]
     fn localhost_is_the_secure_default_bind() {
@@ -407,18 +323,10 @@ mod tests {
         assert!(!config.discovery_enabled());
 
         config.allow_remote_connections = true;
+        assert!(!config.discovery_enabled());
+
+        config.onboarding_completed = true;
         assert!(config.discovery_enabled());
-    }
-
-    #[test]
-    fn token_rotation_replaces_the_existing_secret() {
-        let mut config = AppConfig::default();
-        let old_token = config.api_token.clone();
-        let new_token = config.rotate_api_token();
-
-        assert_ne!(old_token, new_token);
-        assert_eq!(config.api_token, new_token);
-        assert_eq!(config.token_storage, TokenStorage::Keyring);
     }
 
     #[test]
@@ -428,46 +336,52 @@ mod tests {
     }
 
     #[test]
-    fn hydrate_token_migrates_a_legacy_plaintext_value_into_the_credential_store() {
-        let mut config = AppConfig {
-            api_token: "legacy-plaintext-token".to_string(),
-            ..AppConfig::default()
-        };
-
-        config.hydrate_token();
-
-        assert_eq!(config.api_token, "legacy-plaintext-token");
-        assert_eq!(config.token_storage, TokenStorage::Keyring);
-        assert_eq!(
-            credential_store::load_token().as_deref(),
-            Some("legacy-plaintext-token")
-        );
-    }
-
-    #[test]
-    fn hydrate_token_generates_a_fresh_token_when_none_exists() {
-        let mut config = AppConfig::default();
-        assert!(config.api_token.is_empty());
-
-        config.hydrate_token();
-
-        assert!(!config.api_token.is_empty());
-        assert_eq!(config.token_storage, TokenStorage::Keyring);
-    }
-
-    #[test]
-    fn save_to_path_blanks_the_token_once_it_is_in_the_credential_store() {
-        let mut config = AppConfig::default();
-        config.hydrate_token();
+    fn loading_a_legacy_file_discards_shared_secrets_and_global_capabilities() {
         let dir =
             std::env::temp_dir().join(format!("wakemate-config-test-{}", uuid::Uuid::new_v4()));
         let path = dir.join("wakemate.config.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = serde_json::json!({
+            "api_token": "retired-shared-secret",
+            "token_storage": "file",
+            "allow_input_commands": true,
+            "allow_power_commands": true,
+            "require_auth_for_info": false,
+            "allow_remote_connections": true,
+            "allow_discovery": true,
+            "launch_on_startup": false,
+            "device_name": "Existing PC",
+            "tls_port": 7443
+        });
+        std::fs::write(&path, legacy.to_string()).unwrap();
 
-        config.save_to_path(&path).unwrap();
+        let config = AppConfig::load_or_create_from_path(&path).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         let on_disk: serde_json::Value = serde_json::from_str(&raw).unwrap();
-
-        assert_eq!(on_disk["api_token"], "");
+        for retired_field in [
+            "api_token",
+            "token_storage",
+            "allow_input_commands",
+            "allow_power_commands",
+            "require_auth_for_info",
+        ] {
+            assert!(
+                on_disk.get(retired_field).is_none(),
+                "{retired_field} must be retired"
+            );
+        }
+        assert!(!raw.contains("retired-shared-secret"));
+        assert_eq!(config.device_name, "Existing PC");
+        assert_eq!(config.tls_port, 7443);
+        assert!(!config.launch_on_startup);
+        // Retain explicit preferences but require new protocol 5 consent
+        // before honoring their network exposure.
+        assert!(config.allow_remote_connections && config.allow_discovery);
+        assert!(!config.onboarding_completed);
+        assert!(!config.allow_insecure_http);
+        assert_eq!(config.effective_bind_address(), "127.0.0.1:7777");
+        assert_eq!(config.effective_tls_bind_address(), "127.0.0.1:7443");
+        assert!(!config.discovery_enabled());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -482,16 +396,20 @@ mod tests {
         let config = AppConfig::load_or_create_from_path(&path).unwrap();
 
         assert_eq!(config.bind_address, DEFAULT_BIND_ADDRESS);
-        // A corrupt config means this machine was already set up, so recovery
-        // must keep the companion reachable for paired phones instead of
-        // silently retreating to localhost-only.
-        assert!(config.allow_remote_connections);
-        assert!(config.allow_discovery);
+        // Corruption is not consent to expose the machine to the LAN.
+        assert!(!config.allow_remote_connections);
+        assert!(!config.allow_discovery);
+        assert!(!config.allow_insecure_http);
         assert!(config.launch_on_startup);
-        assert!(!config.allow_input_commands);
-        assert!(!config.allow_power_commands);
+        assert!(!config.onboarding_completed);
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(serde_json::from_str::<serde_json::Value>(&raw).is_ok());
+        let backup = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .find(|entry| entry.path().extension().is_some_and(|ext| ext == "corrupt"))
+            .unwrap();
+        assert_eq!(std::fs::read(backup.path()).unwrap(), vec![0u8; 379]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -535,19 +453,126 @@ mod tests {
     }
 
     #[test]
-    fn reset_to_defaults_replaces_the_stored_token() {
-        let mut config = AppConfig::default();
-        config.hydrate_token();
-        let original_token = config.api_token.clone();
-        config.allow_input_commands = true;
+    fn reset_to_defaults_clears_network_consent_and_exposure() {
+        let mut config = AppConfig {
+            onboarding_completed: true,
+            allow_remote_connections: true,
+            allow_discovery: true,
+            allow_insecure_http: true,
+            ..AppConfig::default()
+        };
 
         config.reset_to_defaults();
 
-        assert_ne!(config.api_token, original_token);
-        assert!(!config.allow_input_commands);
-        assert_eq!(
-            credential_store::load_token().as_deref(),
-            Some(config.api_token.as_str())
-        );
+        assert!(!config.onboarding_completed);
+        assert!(!config.allow_remote_connections);
+        assert!(!config.allow_discovery);
+        assert!(!config.allow_insecure_http);
+        assert_eq!(config.effective_tls_bind_address(), "127.0.0.1:7778");
+    }
+
+    #[test]
+    fn installation_never_grants_lan_consent_and_preserves_existing_preferences() {
+        let dir =
+            std::env::temp_dir().join(format!("wakemate-upgrade-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.json");
+        let mut config = AppConfig::prepare_install_config_at_path(&path).unwrap();
+        assert!(config.launch_on_startup);
+        assert!(!config.allow_remote_connections);
+        assert!(!config.allow_discovery);
+        assert!(!config.onboarding_completed);
+        assert!(!config.allow_insecure_http);
+        config.onboarding_completed = true;
+        config.allow_remote_connections = true;
+        config.allow_discovery = true;
+        config.launch_on_startup = false;
+        config.allow_insecure_http = true;
+        config.save_to_path(&path).unwrap();
+        let upgraded = AppConfig::prepare_install_config_at_path(&path).unwrap();
+        assert_eq!(upgraded, config);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn omitted_legacy_http_field_is_disabled_and_explicit_opt_in_is_preserved() {
+        let legacy: AppConfig = serde_json::from_str("{}").unwrap();
+        let modern: AppConfig = serde_json::from_str(r#"{"allow_insecure_http":false}"#).unwrap();
+        let health_only: AppConfig =
+            serde_json::from_str(r#"{"allow_insecure_http":true}"#).unwrap();
+        assert!(!legacy.allow_insecure_http);
+        assert!(!modern.allow_insecure_http);
+        assert!(health_only.allow_insecure_http);
+        assert!(!AppConfig::default().allow_insecure_http);
+    }
+
+    #[test]
+    fn completing_onboarding_honors_the_preserved_network_preferences() {
+        let mut config: AppConfig =
+            serde_json::from_str(r#"{"allow_remote_connections":true,"allow_discovery":true}"#)
+                .unwrap();
+        assert_eq!(config.effective_bind_address(), "127.0.0.1:7777");
+        config.onboarding_completed = true;
+        assert_eq!(config.effective_bind_address(), DEFAULT_BIND_ADDRESS);
+        assert_eq!(config.effective_tls_bind_address(), "0.0.0.0:7778");
+        assert!(config.discovery_enabled());
+    }
+
+    #[test]
+    fn an_unreadable_config_is_not_treated_as_a_clean_install() {
+        let dir =
+            std::env::temp_dir().join(format!("wakemate-config-test-{}", uuid::Uuid::new_v4()));
+        // Reading a directory as a file fails; the loader must return the
+        // error rather than reset settings or grant network access.
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(AppConfig::load_or_create_from_path(&dir).is_err());
+        assert!(dir.is_dir());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_preferred_adapter_only_changes_the_lan_bind_after_consent() {
+        let mut config = AppConfig {
+            preferred_address: Some("10.0.0.19".into()),
+            allow_remote_connections: true,
+            allow_discovery: true,
+            ..AppConfig::default()
+        };
+        assert_eq!(config.effective_bind_address(), "127.0.0.1:7777");
+        assert_eq!(config.effective_tls_bind_address(), "127.0.0.1:7778");
+        config.onboarding_completed = true;
+        assert_eq!(config.effective_bind_address(), "10.0.0.19:7777");
+        assert_eq!(config.effective_tls_bind_address(), "10.0.0.19:7778");
+        assert!(config.discovery_enabled());
+    }
+
+    #[test]
+    fn invalid_preferred_adapters_fail_without_widening_the_saved_bind() {
+        let dir =
+            std::env::temp_dir().join(format!("wakemate-config-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wakemate.config.json");
+        for address in [
+            "",
+            "localhost",
+            "0.0.0.0",
+            "8.8.8.8",
+            "127.0.0.1",
+            "::1",
+            "10.0.0.999",
+        ] {
+            let raw = serde_json::json!({
+                "preferred_address": address,
+                "onboarding_completed": true,
+                "allow_remote_connections": true,
+            })
+            .to_string();
+            std::fs::write(&path, &raw).unwrap();
+            assert!(
+                AppConfig::load_or_create_from_path(&path).is_err(),
+                "{address}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

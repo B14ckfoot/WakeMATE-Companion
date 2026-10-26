@@ -130,7 +130,7 @@ mod windows_impl {
         Foundation::{CloseHandle, FreeLibrary, ERROR_SUCCESS, HANDLE},
         Security::{GetTokenInformation, TokenUIAccess, TOKEN_QUERY},
         System::{
-            LibraryLoader::{GetProcAddress, LoadLibraryW},
+            LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32},
             Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD},
             Threading::{GetCurrentProcess, OpenProcessToken},
         },
@@ -235,7 +235,13 @@ mod windows_impl {
     fn invoke_send_sas(as_user: bool) -> Result<(), String> {
         // Safety: null-terminated wide string, and the module handle is freed
         // on every return path below.
-        let module = unsafe { LoadLibraryW(wide_null("sas.dll").as_ptr()) };
+        let module = unsafe {
+            LoadLibraryExW(
+                wide_null("sas.dll").as_ptr(),
+                0,
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
         if module == 0 {
             return Err("this Windows installation does not provide sas.dll".to_string());
         }

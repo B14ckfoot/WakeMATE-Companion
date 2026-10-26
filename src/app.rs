@@ -1,24 +1,28 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
-    extract::{ConnectInfo, DefaultBodyLimit, Query, State},
-    http::HeaderMap,
+    extract::{ConnectInfo, DefaultBodyLimit, Query, Request, State},
+    http::{header, HeaderMap, HeaderValue},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 
+use crate::request_limits::CommandBudget;
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 use crate::{
     config::{AppConfig, SharedConfig},
-    devices::SharedDeviceRegistry,
+    devices::{Capability, Permissions, SharedDeviceRegistry},
     error::AppError,
-    input::InputController,
+    input_executor::{InputCommand, InputError, InputExecutor},
     pairing::{
         ApprovalState, PairingCoordinator, PairingOutcome, PairingRequestInfo, PendingEnrollment,
     },
     secure_attention::{self, SasOutcome},
-    security::{tokens_match, RateLimiter},
+    security::RateLimiter,
     system,
     types::{
         ApiResponse, CommandRequest, EnrollRequest, EnrollResponse, HealthResponse, InfoResponse,
@@ -36,6 +40,10 @@ pub struct AppState {
     pub rate_limiter: Arc<RateLimiter>,
     pub pairing: Arc<PairingCoordinator>,
     pub registry: SharedDeviceRegistry,
+    pub input: InputExecutor,
+    requests: Arc<Semaphore>,
+    power: Arc<Semaphore>,
+    command_budget: Arc<CommandBudget>,
     /// Defense-in-depth flag for a non-interactive server context. Windows no
     /// longer starts such a server, but any future/headless host still lacks
     /// a desktop session for approval or input, so both stay refused.
@@ -43,18 +51,39 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[cfg(test)]
     pub fn new(
         config: SharedConfig,
         pairing: Arc<PairingCoordinator>,
         registry: SharedDeviceRegistry,
         headless: bool,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, String> {
+        Ok(Self::with_input(
             config,
-            rate_limiter: Arc::new(RateLimiter::new()),
             pairing,
             registry,
             headless,
+            InputExecutor::new().map_err(|e| e.to_string())?,
+        ))
+    }
+
+    pub fn with_input(
+        config: SharedConfig,
+        pairing: Arc<PairingCoordinator>,
+        registry: SharedDeviceRegistry,
+        headless: bool,
+        input: InputExecutor,
+    ) -> Self {
+        Self {
+            config,
+            pairing,
+            registry,
+            headless,
+            input,
+            rate_limiter: Arc::new(RateLimiter::new()),
+            requests: Arc::new(Semaphore::new(64)),
+            power: Arc::new(Semaphore::new(1)),
+            command_budget: Arc::new(CommandBudget::default()),
         }
     }
 }
@@ -71,7 +100,61 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/wake", post(wake))
         .route("/v1/command", post(command))
         .layer(DefaultBodyLimit::max(8 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            native_client_boundary,
+        ))
         .with_state(state)
+}
+
+/// Transitional HTTP is credential-free health only; never enrollment/control.
+pub fn public_router(state: AppState) -> Router {
+    Router::new()
+        .route("/v1/health", get(health))
+        .layer(middleware::from_fn(
+            |request: Request, next: Next| async move {
+                if request.headers().contains_key(AUTH_HEADER)
+                    || request.headers().contains_key(header::AUTHORIZATION)
+                {
+                    AppError::forbidden("Credentials require pinned HTTPS").into_response()
+                } else {
+                    next.run(request).await
+                }
+            },
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            native_client_boundary,
+        ))
+        .with_state(state)
+}
+
+async fn native_client_boundary(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    // WakeMATE has native phone clients, no browser API consumer. A browser
+    // Origin (including "null") is never needed for this local control API.
+    let mut response = if request.headers().contains_key(header::ORIGIN) {
+        AppError::forbidden("browser origins are not allowed").into_response()
+    } else if let Ok(_permit) = state.requests.clone().try_acquire_owned() {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), next.run(request)).await {
+            Ok(response) => response,
+            Err(_) => AppError::request_timeout("Request timed out; retry a short operation")
+                .into_response(),
+        }
+    } else {
+        AppError::too_many_requests("Companion is busy; retry shortly").into_response()
+    };
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 async fn root() -> Json<ApiResponse<()>> {
@@ -98,35 +181,32 @@ async fn info(
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<InfoResponse>>, AppError> {
     let config = config_snapshot(&state.config)?;
-    if config.require_auth_for_info {
-        authenticate(&state, peer, &headers, &config.api_token)?;
-    }
-
-    let bind_address = config.effective_bind_address();
-    let network = system::primary_network_info();
-
+    let principal = authenticate(&state, peer, &headers)?;
+    require_capability(&state, &principal, Capability::Status)?;
+    let permissions = registry_snapshot(&state)?
+        .permissions(&principal.id)
+        .unwrap_or_default();
+    let network = crate::network::for_peer(peer.ip());
     Ok(Json(ApiResponse::ok(
         "companion details",
         InfoResponse {
             device_name: config.device_name.clone(),
             local_ip: network
                 .as_ref()
-                .map(|info| info.local_ip.clone())
-                .unwrap_or_else(|| "127.0.0.1".to_string()),
-            interface_name: network.as_ref().map(|info| info.interface_name.clone()),
-            mac_address: network.as_ref().and_then(|info| info.mac_address.clone()),
-            subnet_mask: network.as_ref().and_then(|info| info.subnet_mask.clone()),
-            broadcast_address: network
-                .as_ref()
-                .and_then(|info| info.broadcast_address.clone()),
-            ping_address: network.as_ref().and_then(|info| info.ping_address.clone()),
-            wol_port: network.as_ref().map(|info| info.wol_port).unwrap_or(9),
-            bind_address,
+                .map(|n| n.local_ip.clone())
+                .unwrap_or_else(|| "127.0.0.1".into()),
+            interface_name: network.as_ref().map(|n| n.interface_name.clone()),
+            mac_address: network.as_ref().and_then(|n| n.mac_address.clone()),
+            subnet_mask: network.as_ref().and_then(|n| n.subnet_mask.clone()),
+            broadcast_address: network.as_ref().and_then(|n| n.broadcast_address.clone()),
+            ping_address: network.as_ref().and_then(|n| n.ping_address.clone()),
+            wol_port: network.as_ref().map(|n| n.wol_port).unwrap_or(9),
+            bind_address: config.effective_tls_bind_address(),
             discovery_port: config.discovery_port,
             allow_remote_connections: config.allow_remote_connections,
             allow_discovery: config.discovery_enabled(),
-            allow_input_commands: config.allow_input_commands,
-            allow_power_commands: config.allow_power_commands,
+            allow_input_commands: permissions.input,
+            allow_power_commands: permissions.power,
         },
     )))
 }
@@ -136,9 +216,8 @@ async fn pairing_check(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
-    let config = config_snapshot(&state.config)?;
-    authenticate(&state, peer, &headers, &config.api_token)?;
-    Ok(Json(ApiResponse::message("pairing token accepted")))
+    authenticate(&state, peer, &headers)?;
+    Ok(Json(ApiResponse::message("approved device accepted")))
 }
 
 async fn pairing_status(
@@ -147,51 +226,44 @@ async fn pairing_status(
     Query(query): Query<PairingStatusQuery>,
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<PairingStatusResponse>>, AppError> {
-    let config = config_snapshot(&state.config)?;
-    authenticate_pairing_status(&state, peer, &headers, &config.api_token)?;
-
-    let device_id = query
+    let credential = authenticate_pairing_status(&state, peer, &headers)?;
+    // Expire the reservation before taking registry locks; callbacks commit in
+    // lifecycle -> registry -> enrollment order.
+    state.pairing.approval_state();
+    let own_id = match &credential {
+        AuthenticatedCredential::Device(principal) => Some(principal.id.clone()),
+        AuthenticatedCredential::PairingSession(token) => state.pairing.session_device_id(token),
+    };
+    if query
         .device_id
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty());
-
-    let approval = if let Some(device_id) = device_id {
-        // Per-device enrollment state: approved once the registry holds it,
-        // pending while it sits in the enrollment slot, otherwise denied
-        // (an explicit "No", an expired prompt, or a later revocation all
-        // mean the same thing to the phone: not authorized, enroll again).
-        // Keep the registry guard until after checking the enrollment slot.
-        // Approval commits in the same registry -> enrollment order, so a
-        // concurrent status read sees either pending before registration or
-        // approved after it, never an absent/false-denied gap between them.
+        .filter(|id| !id.is_empty())
+        .is_some_and(|id| own_id.as_deref() != Some(id))
+    {
+        return Err(AppError::forbidden(
+            "Pairing status is scoped to this phone or QR enrollment",
+        ));
+    }
+    let id = own_id.as_deref();
+    let (approval, permissions) = if let Some(id) = id {
         let registry = registry_snapshot(&state)?;
-        if registry.contains(device_id) {
-            ApprovalState::Approved
-        } else if state.pairing.enrollment_pending_for(device_id) {
-            ApprovalState::Pending
+        if let Some(permissions) = registry.permissions(id).filter(|_| !registry.paused()) {
+            (ApprovalState::Approved, permissions)
+        } else if state.pairing.enrollment_pending_for(id) {
+            (ApprovalState::Pending, Permissions::default())
         } else {
-            ApprovalState::Denied
+            (ApprovalState::Denied, Permissions::default())
         }
     } else {
-        // Legacy process-wide state. If capabilities are already granted (an
-        // earlier approval, possibly in a previous run), report "approved"
-        // even though no prompt happened this session -- the phone cares
-        // about the effective outcome.
-        match state.pairing.approval_state() {
-            ApprovalState::Idle if config.allow_input_commands || config.allow_power_commands => {
-                ApprovalState::Approved
-            }
-            state => state,
-        }
+        (ApprovalState::Idle, Permissions::default())
     };
-
     Ok(Json(ApiResponse::ok(
         "pairing status",
         PairingStatusResponse {
             approval: approval.as_str(),
-            allow_input_commands: config.allow_input_commands,
-            allow_power_commands: config.allow_power_commands,
+            allow_input_commands: approval == ApprovalState::Approved && permissions.input,
+            allow_power_commands: approval == ApprovalState::Approved && permissions.power,
         },
     )))
 }
@@ -202,10 +274,13 @@ async fn pairing_enroll(
     headers: HeaderMap,
     Json(request): Json<EnrollRequest>,
 ) -> Result<Json<ApiResponse<EnrollResponse>>, AppError> {
-    let config = config_snapshot(&state.config)?;
-    // Enrollment specifically requires the shared QR token -- a per-device
-    // token must not be able to mint further device tokens.
-    let credential = authenticate_shared_only(&state, peer, &headers, &config.api_token)?;
+    // Only an unconsumed, short-lived visual invitation can enroll a phone.
+    let credential = authenticate_invitation(&state, peer, &headers)?;
+    if registry_snapshot(&state)?.paused() {
+        return Err(AppError::forbidden(
+            "Remote access is paused. Resume or recover it from the PC settings before pairing.",
+        ));
+    }
 
     if state.headless {
         return Err(AppError::forbidden(
@@ -217,6 +292,11 @@ async fn pairing_enroll(
     let device_name = request
         .device_name
         .as_deref()
+        .filter(|name| {
+            !name.chars().any(|c| {
+                c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            })
+        })
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .map(|name| name.chars().take(MAX_DEVICE_NAME_CHARS).collect::<String>())
@@ -270,49 +350,10 @@ async fn pairing_activate(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<PairingActivationResponse>>, AppError> {
-    let config = config_snapshot(&state.config)?;
-    let credential = authenticate_pairing_activate(&state, peer, &headers, &config.api_token)?;
-
-    if state.headless {
-        return Err(AppError::forbidden(
-            "no one is signed in on this computer right now, so pairing cannot be confirmed; \
-             open the WakeMATE tray app on the desktop and try again",
-        ));
-    }
-
-    let request_info = PairingRequestInfo { peer: peer.ip() };
-    let outcome = match credential.pairing_session_token() {
-        Some(token) => state.pairing.request_with_session(
-            request_info,
-            state.config.clone(),
-            state.registry.clone(),
-            None,
-            Some(token),
-        ),
-        None => state.pairing.request(
-            request_info,
-            state.config.clone(),
-            state.registry.clone(),
-            None,
-        ),
-    };
-
-    match outcome {
-        PairingOutcome::AwaitingApproval | PairingOutcome::Busy => Ok(Json(ApiResponse::ok(
-            "waiting for approval on the desktop",
-            PairingActivationResponse {
-                allow_input_commands: config.allow_input_commands,
-                allow_power_commands: config.allow_power_commands,
-                status: "pending_approval",
-            },
-        ))),
-        PairingOutcome::Unavailable => Err(AppError::forbidden(
-            "the WakeMATE tray app is not running, so pairing cannot be confirmed on this computer",
-        )),
-        PairingOutcome::InvalidSession => Err(AppError::unauthorized(
-            "this pairing QR code has expired or was already used; show a new pairing QR code and scan it again",
-        )),
-    }
+    authenticate_pairing_status(&state, peer, &headers)?;
+    Err(AppError::forbidden(
+        "Legacy activation is retired. Update the phone app and scan a new pairing QR code.",
+    ))
 }
 
 async fn wake(
@@ -321,16 +362,19 @@ async fn wake(
     headers: HeaderMap,
     Json(request): Json<WakeRequest>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
-    let config = config_snapshot(&state.config)?;
-    authenticate(&state, peer, &headers, &config.api_token)?;
-
+    let principal = authenticate(&state, peer, &headers)?;
+    require_capability(&state, &principal, Capability::Wake)?;
+    if !state.command_budget.admit(&principal.id, Capability::Wake) {
+        return Err(AppError::too_many_requests(
+            "Wake requests are limited to four per second per phone",
+        ));
+    }
     system::send_wol(
         &request.mac,
         request.broadcast.as_deref().unwrap_or("255.255.255.255"),
         request.port.unwrap_or(9),
     )
     .map_err(AppError::bad_request)?;
-
     Ok(Json(ApiResponse::message("wake packet sent")))
 }
 
@@ -340,18 +384,30 @@ async fn command(
     headers: HeaderMap,
     Json(request): Json<CommandRequest>,
 ) -> Result<Json<ApiResponse<SecurityCommandResult>>, AppError> {
-    let config = config_snapshot(&state.config)?;
-    authenticate(&state, peer, &headers, &config.api_token)?;
-
-    // Handled ahead of the shared match because it is the one command that
-    // answers with a structured payload instead of a bare message.
-    if let CommandRequest::SecurityScreen { fallback } = request {
-        ensure_power_enabled(&state, &config)?;
-        return Ok(Json(security_screen(&state, fallback)));
+    let principal = authenticate(&state, peer, &headers)?;
+    let capability = match &request {
+        CommandRequest::Wake { .. } => Capability::Wake,
+        CommandRequest::System { .. } | CommandRequest::SecurityScreen { .. } => Capability::Power,
+        CommandRequest::Media { .. } => Capability::Media,
+        _ => Capability::Input,
+    };
+    require_capability(&state, &principal, capability)?;
+    if !state.command_budget.admit(&principal.id, capability) {
+        return Err(AppError::too_many_requests(
+            "Command rate exceeded; slow down and retry",
+        ));
     }
-
-    let input = InputController;
-    let message = match request {
+    if state.headless
+        && matches!(
+            capability,
+            Capability::Input | Capability::Media | Capability::Power
+        )
+    {
+        return Err(AppError::forbidden(
+            "Desktop commands require an interactive user session",
+        ));
+    }
+    match request {
         CommandRequest::Wake {
             mac,
             broadcast,
@@ -363,76 +419,112 @@ async fn command(
                 port.unwrap_or(9),
             )
             .map_err(AppError::bad_request)?;
-            "wake packet sent".to_string()
+            return Ok(Json(ApiResponse::ok_empty("wake packet sent")));
         }
-        CommandRequest::MouseMove { delta_x, delta_y } => {
-            ensure_input_enabled(&state, &config)?;
-            input
-                .mouse_move_relative(delta_x, delta_y)
-                .map_err(AppError::internal)?;
-            format!("mouse moved by {delta_x}, {delta_y}")
-        }
-        CommandRequest::MouseClick { button, double } => {
-            ensure_input_enabled(&state, &config)?;
-            let button = button.unwrap_or(crate::types::MouseButtonArg::Left);
-            let double = double.unwrap_or(false);
-            input
-                .mouse_click(button, double)
-                .map_err(AppError::internal)?;
-            if double {
-                "mouse double click sent".to_string()
-            } else {
-                "mouse click sent".to_string()
-            }
-        }
-        CommandRequest::MouseButton { button, action } => {
-            ensure_input_enabled(&state, &config)?;
-            let button = button.unwrap_or(crate::types::MouseButtonArg::Left);
-            input
-                .mouse_button(button, action)
-                .map_err(AppError::internal)?;
-            "mouse button state sent".to_string()
-        }
-        CommandRequest::MouseScroll { direction, amount } => {
-            ensure_input_enabled(&state, &config)?;
-            let amount = amount.unwrap_or(3);
-            input
-                .mouse_scroll(direction, amount)
-                .map_err(AppError::internal)?;
-            "mouse scroll sent".to_string()
-        }
-        CommandRequest::KeyPress { key } => {
-            ensure_input_enabled(&state, &config)?;
-            input.key_press(&key).map_err(AppError::bad_request)?;
-            format!("key press sent: {key}")
-        }
-        CommandRequest::TextInput { text } => {
-            ensure_input_enabled(&state, &config)?;
-            input.text_input(&text).map_err(AppError::internal)?;
-            "text input sent".to_string()
-        }
-        CommandRequest::Media { action } => {
-            ensure_input_enabled(&state, &config)?;
-            input.media_action(action).map_err(AppError::bad_request)?;
-            "media command sent".to_string()
+        CommandRequest::SecurityScreen { fallback } => {
+            let permit =
+                state.power.clone().try_acquire_owned().map_err(|_| {
+                    AppError::too_many_requests("A system action is already running")
+                })?;
+            let state_for_worker = state.clone();
+            let id = principal.id.clone();
+            return tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                require_capability(&state_for_worker, &Principal { id }, Capability::Power)?;
+                Ok(Json(security_screen(&state_for_worker, fallback)))
+            })
+            .await
+            .map_err(|_| AppError::internal("System worker stopped"))?;
         }
         CommandRequest::System { action } => {
-            ensure_power_enabled(&state, &config)?;
-            system::perform_system_action(action)
-                .map_err(AppError::unsupported)?
-                .to_string()
+            let permit =
+                state.power.clone().try_acquire_owned().map_err(|_| {
+                    AppError::too_many_requests("A system action is already running")
+                })?;
+            let registry = state.registry.clone();
+            let id = principal.id.clone();
+            let message = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                if !registry
+                    .lock()
+                    .map(|r| r.allows(&id, Capability::Power))
+                    .unwrap_or(false)
+                {
+                    return Err(AppError::forbidden(
+                        "Permission was revoked or control paused",
+                    ));
+                }
+                system::perform_system_action(action).map_err(AppError::unsupported)
+            })
+            .await
+            .map_err(|_| AppError::internal("System worker stopped"))??;
+            return Ok(Json(ApiResponse::ok_empty(message)));
         }
-        // Returned above, before this match runs. Reported as an error rather
-        // than a panic so a future refactor that breaks that invariant fails
-        // one request instead of the connection.
-        CommandRequest::SecurityScreen { .. } => {
-            return Err(AppError::internal(
-                "security screen command was not dispatched",
-            ));
+        request => {
+            let input = match request {
+                CommandRequest::MouseMove { delta_x, delta_y } => {
+                    InputCommand::MouseMove { delta_x, delta_y }
+                }
+                CommandRequest::MouseClick { button, double } => InputCommand::MouseClick {
+                    button: button.unwrap_or(crate::types::MouseButtonArg::Left),
+                    double: double.unwrap_or(false),
+                },
+                CommandRequest::MouseButton { button, action } => InputCommand::MouseButton {
+                    button: button.unwrap_or(crate::types::MouseButtonArg::Left),
+                    action,
+                },
+                CommandRequest::MouseScroll { direction, amount } => InputCommand::MouseScroll {
+                    direction,
+                    amount: amount.unwrap_or(3),
+                },
+                CommandRequest::KeyPress { key } => InputCommand::KeyPress { key },
+                CommandRequest::TextInput { text } => InputCommand::TextInput { text },
+                CommandRequest::Media { action } => InputCommand::Media { action },
+                _ => return Err(AppError::bad_request("Unsupported input command")),
+            };
+            let registry = state.registry.clone();
+            let id = principal.id.clone();
+            let authorize = Arc::new(move || {
+                registry
+                    .lock()
+                    .map(|r| r.allows(&id, capability))
+                    .unwrap_or(false)
+            });
+            state
+                .input
+                .execute(&principal.id, input, authorize)
+                .await
+                .map_err(input_error)?;
         }
-    };
+    }
+    Ok(Json(ApiResponse::ok_empty("input accepted by Windows")))
+}
 
-    Ok(Json(ApiResponse::ok_empty(message)))
+fn input_error(error: InputError) -> AppError {
+    match error {
+        InputError::Invalid(message) => AppError::bad_request(message),
+        InputError::Busy => AppError::too_many_requests(
+            "Remote input is busy; release local keys/buttons or retry shortly",
+        ),
+        InputError::Cancelled | InputError::Denied => {
+            AppError::forbidden("Input cancelled: permission changed or control paused")
+        }
+        InputError::Unsupported(message) => AppError::unsupported(message),
+        InputError::Execution(message) => AppError::internal(message),
+        InputError::Unavailable => AppError::internal("Input worker unavailable"),
+    }
+}
+
+fn require_capability(
+    state: &AppState,
+    principal: &Principal,
+    capability: Capability,
+) -> Result<(), AppError> {
+    if registry_snapshot(state)?.allows(&principal.id, capability) {
+        Ok(())
+    } else {
+        Err(AppError::forbidden("This phone does not have permission, or remote control is paused. Change permissions on the PC."))
+    }
 }
 
 /// Runs the Ctrl+Alt+Delete request and reports exactly what Windows did.
@@ -539,214 +631,105 @@ fn apply_fallback(
     }
 }
 
-/// How `authenticate_inner` treats the one-time pairing-session token (the
-/// credential embedded in the structured pairing QR code) in addition to the
-/// permanent shared `api_token`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SessionTokenMode {
-    /// Not accepted at all (`/v1/wake`, `/v1/command`, `/v1/info`): the
-    /// pairing-session token is scoped to the pairing endpoints only.
-    None,
-    /// Accepted without being consumed (`/v1/pairing/status`), since a phone
-    /// polls this repeatedly with the same token while waiting for desktop
-    /// approval.
-    ReadOnly,
-    /// Accepted only while still claimable (`/v1/pairing/enroll`,
-    /// `/v1/pairing/activate`). The coordinator burns it later, at the exact
-    /// point a new desktop prompt is reserved, so Busy/Unavailable responses
-    /// do not destroy an otherwise retryable QR code.
-    Claimable,
+#[derive(Clone)]
+struct Principal {
+    id: String,
 }
 
 enum AuthenticatedCredential {
-    Shared,
     PairingSession(String),
-    Device,
+    Device(Principal),
 }
-
 impl AuthenticatedCredential {
     fn pairing_session_token(&self) -> Option<&str> {
         match self {
-            Self::PairingSession(token) => Some(token.as_str()),
-            Self::Shared | Self::Device => None,
+            Self::PairingSession(token) => Some(token),
+            Self::Device(_) => None,
         }
     }
 }
 
-/// Validates the pairing credential -- the shared QR token or any approved
-/// per-device token -- with constant-time comparisons, and applies the
-/// per-IP lockout so a stolen or guessed token cannot be brute-forced by
-/// hammering any authenticated endpoint.
 fn authenticate(
     state: &AppState,
     peer: SocketAddr,
     headers: &HeaderMap,
-    expected_token: &str,
-) -> Result<AuthenticatedCredential, AppError> {
-    authenticate_inner(
-        state,
-        peer,
-        headers,
-        expected_token,
-        true,
-        SessionTokenMode::None,
-    )
+) -> Result<Principal, AppError> {
+    match authenticate_inner(state, peer, headers, true, false, false)? {
+        AuthenticatedCredential::Device(principal) => Ok(principal),
+        _ => Err(AppError::unauthorized(
+            "Approved device credential required",
+        )),
+    }
 }
-
-/// Like `authenticate`, but only the shared QR token or a valid one-time
-/// pairing-session token is accepted -- never a per-device token, so an
-/// already-approved phone can never mint further device tokens for other
-/// phones. Authentication only establishes that the session token is still
-/// claimable; the coordinator consumes it once a prompt can be shown.
-fn authenticate_shared_only(
+fn authenticate_invitation(
     state: &AppState,
     peer: SocketAddr,
     headers: &HeaderMap,
-    expected_token: &str,
 ) -> Result<AuthenticatedCredential, AppError> {
-    authenticate_inner(
-        state,
-        peer,
-        headers,
-        expected_token,
-        false,
-        SessionTokenMode::Claimable,
-    )
+    authenticate_inner(state, peer, headers, false, true, true)
 }
-
-/// Used by `/v1/pairing/status`: accepts the shared token, an approved
-/// device token, or the current pairing-session token, without consuming
-/// the session token -- a phone polls this endpoint repeatedly with the same
-/// token while waiting for the desktop prompt to be answered.
 fn authenticate_pairing_status(
     state: &AppState,
     peer: SocketAddr,
     headers: &HeaderMap,
-    expected_token: &str,
 ) -> Result<AuthenticatedCredential, AppError> {
-    authenticate_inner(
-        state,
-        peer,
-        headers,
-        expected_token,
-        true,
-        SessionTokenMode::ReadOnly,
-    )
+    authenticate_inner(state, peer, headers, true, true, false)
 }
-
-/// Used by `/v1/pairing/activate` (the legacy, non-per-device pairing
-/// flow): accepts the shared token, an approved device token, or the
-/// current pairing-session token. A claimable session is consumed later only
-/// when the coordinator can reserve a new prompt.
-fn authenticate_pairing_activate(
-    state: &AppState,
-    peer: SocketAddr,
-    headers: &HeaderMap,
-    expected_token: &str,
-) -> Result<AuthenticatedCredential, AppError> {
-    authenticate_inner(
-        state,
-        peer,
-        headers,
-        expected_token,
-        true,
-        SessionTokenMode::Claimable,
-    )
-}
-
 fn authenticate_inner(
     state: &AppState,
     peer: SocketAddr,
     headers: &HeaderMap,
-    expected_token: &str,
-    accept_device_tokens: bool,
-    session_mode: SessionTokenMode,
+    devices: bool,
+    invitations: bool,
+    claimable: bool,
 ) -> Result<AuthenticatedCredential, AppError> {
     if let Some(remaining) = state.rate_limiter.locked_out(peer.ip()) {
         return Err(AppError::too_many_requests(format!(
-            "too many failed attempts; try again in {} seconds",
+            "Too many failed attempts; retry in {} seconds",
             remaining.as_secs().max(1)
         )));
     }
-
-    let provided = headers
-        .get(AUTH_HEADER)
-        .and_then(|value| value.to_str().ok());
-
-    let credential = provided.and_then(|provided| {
-        if tokens_match(provided, expected_token) {
-            return Some(AuthenticatedCredential::Shared);
-        }
-        match session_mode {
-            SessionTokenMode::None => {}
-            SessionTokenMode::ReadOnly => {
-                if state.pairing.pairing_session_matches(provided) {
-                    return Some(AuthenticatedCredential::PairingSession(
-                        provided.to_string(),
-                    ));
-                }
+    let provided = headers.get(AUTH_HEADER).and_then(|v| v.to_str().ok());
+    let credential = provided.and_then(|token| {
+        if invitations
+            && if claimable {
+                state.pairing.pairing_session_claimable(token)
+            } else {
+                state.pairing.pairing_session_matches(token)
             }
-            SessionTokenMode::Claimable => {
-                if state.pairing.pairing_session_claimable(provided) {
-                    return Some(AuthenticatedCredential::PairingSession(
-                        provided.to_string(),
-                    ));
-                }
-            }
+        {
+            return Some(AuthenticatedCredential::PairingSession(token.into()));
         }
-        if !accept_device_tokens {
-            return None;
+        if devices {
+            return state
+                .registry
+                .lock()
+                .ok()
+                .and_then(|r| r.authenticate(token))
+                .map(|id| AuthenticatedCredential::Device(Principal { id }));
         }
-        state
-            .registry
-            .lock()
-            .ok()
-            .and_then(|registry| registry.authenticate(provided))
-            .map(|_| AuthenticatedCredential::Device)
+        None
     });
-
-    let Some(credential) = credential else {
-        state.rate_limiter.record_failure(peer.ip());
-        return Err(AppError::unauthorized("unauthorized"));
-    };
-
-    state.rate_limiter.record_success(peer.ip());
-    Ok(credential)
+    match credential {
+        Some(credential) => {
+            state.rate_limiter.record_success(peer.ip());
+            Ok(credential)
+        }
+        None => {
+            state.rate_limiter.record_failure(peer.ip());
+            Err(AppError::unauthorized(
+                "Approved device or current QR invitation required",
+            ))
+        }
+    }
 }
-
 fn registry_snapshot(
     state: &AppState,
 ) -> Result<std::sync::MutexGuard<'_, crate::devices::DeviceRegistry>, AppError> {
     state
         .registry
         .lock()
-        .map_err(|_| AppError::internal("failed to access the paired-device registry"))
-}
-
-fn ensure_input_enabled(state: &AppState, config: &AppConfig) -> Result<(), AppError> {
-    if state.headless {
-        return Err(AppError::forbidden(
-            "input commands are not available from a non-interactive server",
-        ));
-    }
-
-    if config.allow_input_commands {
-        Ok(())
-    } else {
-        Err(AppError::forbidden(
-            "input commands are disabled in the config",
-        ))
-    }
-}
-
-fn ensure_power_enabled(_state: &AppState, config: &AppConfig) -> Result<(), AppError> {
-    if config.allow_power_commands {
-        Ok(())
-    } else {
-        Err(AppError::forbidden(
-            "power commands are disabled in the config",
-        ))
-    }
+        .map_err(|_| AppError::internal("Device registry unavailable"))
 }
 
 fn config_snapshot(config: &SharedConfig) -> Result<AppConfig, AppError> {
@@ -755,3 +738,7 @@ fn config_snapshot(config: &SharedConfig) -> Result<AppConfig, AppError> {
         .map(|guard| guard.clone())
         .map_err(|_| AppError::internal("failed to access application config"))
 }
+
+#[cfg(test)]
+#[path = "app_tests.rs"]
+mod tests;

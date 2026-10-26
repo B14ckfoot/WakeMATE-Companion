@@ -2,15 +2,22 @@
 
 mod app;
 mod config;
-mod credential_store;
+#[cfg(target_os = "windows")]
+mod desktop;
 mod devices;
 mod discovery;
 mod error;
 mod input;
+mod input_executor;
+mod network;
 mod pairing;
 mod pairing_qr;
+mod request_limits;
+mod runtime_status;
 mod secure_attention;
 mod security;
+#[cfg(target_os = "windows")]
+mod server_thread;
 mod system;
 mod theme;
 mod tls;
@@ -49,6 +56,15 @@ const HEADLESS_SERVER_ARG: &str = "--headless-server";
 const CONFIG_PATH_ARG: &str = "--config-path";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let result = start();
+    #[cfg(target_os = "windows")]
+    if let Err(error) = &result {
+        system::show_error_dialog("WakeMATE could not start", &error.to_string());
+    }
+    result
+}
+
+fn start() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
     tls::install_crypto_provider();
 
@@ -67,7 +83,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let config_path = config_path_from_args(&args)?.unwrap_or(AppConfig::path()?);
+    #[cfg(target_os = "windows")]
+    if args.iter().any(|arg| arg == "--request-exit") {
+        system::request_exit_for_current_executable().map_err(std::io::Error::other)?;
+        return Ok(());
+    }
+    system::ensure_normal_user_runtime().map_err(std::io::Error::other)?;
+
+    #[cfg(target_os = "windows")]
+    let _single_instance_lock = match system::acquire_single_instance_lock() {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            info!("WakeMATE is already running; exiting this second instance");
+            return Ok(());
+        }
+        Err(error) => return Err(std::io::Error::other(error).into()),
+    };
+
+    let config_path = match config_path_from_args(&args)? {
+        Some(path) => path,
+        None => AppConfig::path()?,
+    };
 
     if args.iter().any(|arg| arg == PREPARE_INSTALL_CONFIG_ARG) {
         let config = AppConfig::prepare_install_config_at_path(&config_path)?;
@@ -86,6 +122,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if args.iter().any(|arg| arg == "--installed") && !config_path.try_exists()? {
+        AppConfig::prepare_install_config_at_path(&config_path)?;
+    }
     let config = Arc::new(Mutex::new(AppConfig::load_or_create_from_path(
         &config_path,
     )?));
@@ -116,18 +155,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(target_os = "windows")]
     {
-        let _single_instance_lock = match system::acquire_single_instance_lock() {
-            Ok(Some(lock)) => Some(lock),
-            Ok(None) => {
-                info!("WakeMATE is already running; exiting this second instance");
-                return Ok(());
-            }
-            Err(error) => {
-                warn!(%error, "failed to acquire the WakeMATE single-instance lock; continuing anyway");
-                None
-            }
-        };
-
         tray::run(config)?;
         Ok(())
     }
@@ -147,7 +174,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             config,
             pairing,
             registry,
-            false,
+            true,
+            input_executor::InputExecutor::new().map_err(std::io::Error::other)?,
+            Arc::new(Mutex::new(runtime_status::RuntimeStatus::default())),
             shutdown_signal(),
         ))?;
         Ok(())
@@ -168,6 +197,8 @@ pub(crate) async fn run_server<F>(
     pairing: Arc<PairingCoordinator>,
     registry: SharedDeviceRegistry,
     headless: bool,
+    input: input_executor::InputExecutor,
+    status: runtime_status::SharedRuntimeStatus,
     shutdown: F,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -179,71 +210,89 @@ where
     let tls_bind_address = snapshot.effective_tls_bind_address();
     let tls_socket_address: SocketAddr = tls_bind_address.parse()?;
     let rustls_config = tls_identity.rustls_config().await?;
+    // Bind before advertising readiness. Keep every owned task and input worker
+    // under this supervisor, including all failure paths.
+    let tls_listener = std::net::TcpListener::bind(tls_socket_address)?;
+    tls_listener.set_nonblocking(true)?;
+    let tls_server = axum_server::from_tcp_rustls(tls_listener, rustls_config)?;
     let http_listener = if snapshot.allow_insecure_http {
-        let bind_address = snapshot.effective_bind_address();
-        let listener = TcpListener::bind(&bind_address).await?;
-        info!(
-            bind = %bind_address,
-            headless,
-            "WakeMATE transitional HTTP listener ready"
-        );
-        Some(listener)
+        Some(TcpListener::bind(snapshot.effective_bind_address()).await?)
     } else {
-        info!("WakeMATE insecure HTTP compatibility listener disabled");
         None
     };
-    info!(
-        bind = %tls_bind_address,
-        headless,
-        "WakeMATE pinned HTTPS listener ready"
-    );
-
-    let discovery_task = if snapshot.discovery_enabled() {
-        Some(tokio::spawn(discovery::run(
-            config.clone(),
-            tls_fingerprint,
-        )))
-    } else {
-        info!("WakeMATE UDP discovery disabled until remote access is enabled");
-        None
-    };
-
-    let state = AppState::new(config, pairing, registry, headless);
-    let tls_handle = axum_server::Handle::new();
-    let shutdown_tls_handle = tls_handle.clone();
-    let (http_shutdown_tx, http_shutdown_rx) = watch::channel(false);
-    let shutdown_task = tokio::spawn(async move {
-        shutdown.await;
-        shutdown_tls_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
-        let _ = http_shutdown_tx.send(true);
-    });
-
-    let tls_server = axum_server::bind_rustls(tls_socket_address, rustls_config)
-        .handle(tls_handle)
-        .serve(router(state.clone()).into_make_service_with_connect_info::<SocketAddr>());
-
-    if let Some(listener) = http_listener {
-        let http_server = axum::serve(
-            listener,
-            router(state).into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(wait_for_shutdown(http_shutdown_rx));
-
-        tokio::select! {
-            result = tls_server => result?,
-            result = http_server => result?,
+    let discovery_socket = if snapshot.discovery_enabled() {
+        match discovery::bind(&config).await {
+            Ok(socket) => Some(socket),
+            Err(error) => {
+                status.lock().unwrap_or_else(|p| p.into_inner()).error =
+                    Some(format!("HTTPS ready, discovery unavailable: {error}"));
+                None
+            }
         }
     } else {
-        tls_server.await?;
+        None
+    };
+    {
+        let mut current = status.lock().unwrap_or_else(|p| p.into_inner());
+        current.https_ready = true;
+        current.discovery_ready = discovery_socket.is_some();
     }
-
-    if let Some(discovery_task) = discovery_task {
-        discovery_task.abort();
-        let _ = discovery_task.await;
-    }
+    info!(bind = %tls_bind_address, "WakeMATE HTTPS listener bound");
+    let discovery_config = config.clone();
+    let discovery_task = tokio::spawn(async move {
+        match discovery_socket {
+            Some(socket) => discovery::run(discovery_config, tls_fingerprint, socket).await,
+            None => std::future::pending::<std::io::Result<()>>().await,
+        }
+    });
+    let state = AppState::with_input(config, pairing, registry, headless, input.clone());
+    let tls_handle = axum_server::Handle::new();
+    let shutdown_tls = tls_handle.clone();
+    let (http_shutdown_tx, http_shutdown_rx) = watch::channel(false);
+    let stop_input = input.clone();
+    let shutdown_task = tokio::spawn(async move {
+        shutdown.await;
+        stop_input.shutdown();
+        shutdown_tls.graceful_shutdown(Some(std::time::Duration::from_secs(2)));
+        let _ = http_shutdown_tx.send(true);
+    });
+    let tls_server = tls_server
+        .handle(tls_handle.clone())
+        .serve(router(state.clone()).into_make_service_with_connect_info::<SocketAddr>());
+    let http_server = async move {
+        match http_listener {
+            Some(listener) => {
+                axum::serve(
+                    listener,
+                    app::public_router(state).into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(wait_for_shutdown(http_shutdown_rx))
+                .await
+            }
+            None => std::future::pending::<std::io::Result<()>>().await,
+        }
+    };
+    let mut discovery_task = discovery_task;
+    let result = tokio::select! {
+        result = tls_server => result,
+        result = http_server => result,
+        result = &mut discovery_task => match result {
+            Ok(result) => result,
+            Err(error) => Err(std::io::Error::other(error)),
+        },
+    };
+    input.shutdown();
+    tls_handle.shutdown();
+    discovery_task.abort();
     shutdown_task.abort();
     let _ = shutdown_task.await;
-    Ok(())
+    let mut current = status.lock().unwrap_or_else(|p| p.into_inner());
+    current.https_ready = false;
+    current.discovery_ready = false;
+    if let Err(error) = &result {
+        current.error = Some(error.to_string());
+    }
+    result.map_err(Into::into)
 }
 
 async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
@@ -299,6 +348,13 @@ fn config_path_from_args(
     let mut index = 0;
     while index < args.len() {
         if args[index] == CONFIG_PATH_ARG {
+            if !args.iter().any(|arg| arg == PREPARE_INSTALL_CONFIG_ARG) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--config-path is supported only with --prepare-install-config",
+                )
+                .into());
+            }
             let Some(path) = args.get(index + 1) else {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -312,4 +368,26 @@ fn config_path_from_args(
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_config_path_is_only_accepted_for_installer_preparation() {
+        let args = vec![CONFIG_PATH_ARG.to_string(), "custom.json".to_string()];
+        assert!(config_path_from_args(&args).is_err());
+        let mut install_args = vec![PREPARE_INSTALL_CONFIG_ARG.to_string()];
+        install_args.extend(args);
+        assert_eq!(
+            config_path_from_args(&install_args).unwrap(),
+            Some("custom.json".into())
+        );
+        assert!(config_path_from_args(&[
+            PREPARE_INSTALL_CONFIG_ARG.into(),
+            CONFIG_PATH_ARG.into()
+        ])
+        .is_err());
+    }
 }

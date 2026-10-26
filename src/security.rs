@@ -31,6 +31,7 @@ pub fn tokens_match(provided: &str, expected: &str) -> bool {
 const MAX_FAILURES_PER_WINDOW: u32 = 8;
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const LOCKOUT_DURATION: Duration = Duration::from_secs(60);
+const MAX_TRACKED_ADDRESSES: usize = 4096;
 
 #[derive(Default)]
 struct AttemptRecord {
@@ -56,13 +57,17 @@ impl RateLimiter {
 
     /// Returns `Some(remaining)` if the given address is currently locked out.
     pub fn locked_out(&self, addr: IpAddr) -> Option<Duration> {
-        let attempts = self
+        let mut attempts = self
             .attempts
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        let now = Instant::now();
+        prune_attempts(&mut attempts, now);
+        if attempts.len() >= MAX_TRACKED_ADDRESSES && !attempts.contains_key(&addr) {
+            return Some(FAILURE_WINDOW);
+        }
         let record = attempts.get(&addr)?;
         let locked_until = record.locked_until?;
-        let now = Instant::now();
         if locked_until > now {
             Some(locked_until - now)
         } else {
@@ -76,6 +81,10 @@ impl RateLimiter {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let now = Instant::now();
+        prune_attempts(&mut attempts, now);
+        if attempts.len() >= MAX_TRACKED_ADDRESSES && !attempts.contains_key(&addr) {
+            return;
+        }
         let record = attempts.entry(addr).or_default();
 
         let window_expired = record
@@ -104,6 +113,15 @@ impl RateLimiter {
     }
 }
 
+fn prune_attempts(attempts: &mut HashMap<IpAddr, AttemptRecord>, now: Instant) {
+    attempts.retain(|_, record| {
+        record.locked_until.is_some_and(|until| until > now)
+            || record
+                .window_started_at
+                .is_some_and(|started| now.duration_since(started) < FAILURE_WINDOW)
+    });
+}
+
 impl Default for RateLimiter {
     fn default() -> Self {
         Self::new()
@@ -113,6 +131,26 @@ impl Default for RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn address_flood_is_bounded_and_expired_records_recover_capacity() {
+        let limiter = RateLimiter::new();
+        for n in 0..MAX_TRACKED_ADDRESSES + 100 {
+            limiter.record_failure(IpAddr::V4((n as u32).into()));
+        }
+        assert_eq!(
+            limiter.attempts.lock().unwrap().len(),
+            MAX_TRACKED_ADDRESSES
+        );
+        let new_peer = "10.1.2.3".parse().unwrap();
+        assert!(limiter.locked_out(new_peer).is_some());
+        for record in limiter.attempts.lock().unwrap().values_mut() {
+            record.window_started_at =
+                Some(Instant::now() - FAILURE_WINDOW - Duration::from_secs(1));
+        }
+        assert!(limiter.locked_out(new_peer).is_none());
+        assert!(limiter.attempts.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn matching_tokens_compare_equal() {

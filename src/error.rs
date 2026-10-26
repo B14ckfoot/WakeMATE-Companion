@@ -13,6 +13,13 @@ pub struct AppError {
 }
 
 impl AppError {
+    pub fn request_timeout(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::REQUEST_TIMEOUT,
+            message: message.into(),
+        }
+    }
+
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,

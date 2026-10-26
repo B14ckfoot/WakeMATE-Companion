@@ -7,17 +7,16 @@ paths:
   - "scripts/**/*.ps1"
   - "installer/**/*"
   - "docs/RELEASE_CHECKLIST.md"
-  - "docs/EULA.txt"
-  - "docs/PRIVACY_TEMPLATE.md"
-  - "docs/THIRD_PARTY_NOTICES_TEMPLATE.md"
 ---
 
-# Release and packaging
+# Release evidence
 
-- Keep the Cargo package version, Inno Setup version, macOS bundle version, output names, checksums, and release tag expectations consistent.
-- Run the full quality gate before packaging. A package job must not substitute for formatting, linting, tests, and release-build validation.
-- Preserve reviewable Windows installer and macOS DMG artifacts with deterministic names and SHA-256 checksums. Keep the GitHub release a draft until a maintainer reviews it.
-- When either platform pipeline changes, verify the other is still preserved and dependencies/paths remain valid. Do not present the current unsigned macOS preview as production-ready.
-- Installer upgrades must preserve user config and pairing state; uninstall cleanup must cover registered tasks, startup entries, and firewall rules while documenting retained data accurately.
-- Never commit certificates, private keys, provisioning data, signing passwords, tokens, or machine paths. Do not add placeholder signing that appears enabled; use protected CI secrets only when real signing is authorized.
-- Do not tag, trigger a release, publish a draft, or alter signing configuration without explicit user permission.
+- Keep Cargo, Windows installer, macOS metadata, artifact names, and release tag versions consistent. Protocol version is a separate explicit wire contract.
+- Format/lint/tests/release build and dependency audit precede packaging. Do not suppress errors/findings or treat successful packaging as device/installer QA.
+- Verify build/source/executable provenance before packaging. Compatibility switches must never bypass this. Write each package run to a fresh output directory and retain SHA-256 plus provenance alongside it.
+- Verify bundled prerequisites, including the Microsoft VC++ redistributable signature. Preserve previous artifacts; an old same-version installer is not evidence of current source.
+- Keep installer elevation narrow, no automatic tray launch, program/port/Private/LocalSubnet firewall scope, graceful path-scoped shutdown, and accurate upgrade/uninstall/retained-data behavior.
+- Lock or verify workflow dependencies and minimize job token privileges. Keep generated releases draft-only pending maintainer review.
+- Never enable placeholder signing or commit signing credentials, keys, certificates, tokens, or machine-specific config. Label unsigned/non-notarized output truthfully.
+- Preserve both platform pipelines while retaining macOS preview labeling. Clean-VM/account/session, physical Android/iOS, actual wake/input, and macOS runtime checks remain explicit release boundaries.
+- Do not commit/push/tag/publish or change signing configuration unless the user explicitly asks.
